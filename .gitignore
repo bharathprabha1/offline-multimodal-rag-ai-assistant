@@ -1,0 +1,111 @@
+# =========================================================
+# OFFLINE MULTIMODAL RAG AI ASSISTANT - GITIGNORE
+# =========================================================
+
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# -------------------------
+# Virtual Environments
+# -------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# -------------------------
+# PyCharm / IDE
+# -------------------------
+.idea/
+.vscode/
+
+# -------------------------
+# Build & Distribution
+# -------------------------
+build/
+dist/
+*.egg-info/
+
+# -------------------------
+# PyInstaller
+# -------------------------
+*.manifest
+*.spec~
+
+# Keep rag.spec if you want your build configuration
+# rag.spec
+
+# -------------------------
+# Cache
+# -------------------------
+cache/
+.cache/
+*.cache
+
+# -------------------------
+# Large AI Models
+# -------------------------
+models/
+*.gguf
+*.ggml
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# -------------------------
+# Local AI / External Tools
+# -------------------------
+llama_cpp/
+vosk/
+vosk-model-*/
+ffmpeg/
+Tesseract-OCR/
+Graphviz-*/
+windows_*-cmake_*/
+
+# -------------------------
+# User / Local Data
+# -------------------------
+files/
+chat_history.json
+search_history.txt
+
+# -------------------------
+# Executables
+# -------------------------
+*.exe
+*.dll
+
+# -------------------------
+# Logs
+# -------------------------
+*.log
+
+# -------------------------
+# Temporary Files
+# -------------------------
+*.tmp
+*.temp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Environment / Secrets
+# -------------------------
+.env
+.env.*
+!.env.example
+
+# -------------------------
+# Jupyter
+# -------------------------
+.ipynb_checkpoints/

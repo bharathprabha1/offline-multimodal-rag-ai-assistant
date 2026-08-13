@@ -1,0 +1,38 @@
+# Core
+numpy
+scipy
+scikit-learn
+
+# Document Processing
+PyPDF2
+python-docx
+
+# NLP / RAG
+sentence-transformers
+transformers
+torch
+huggingface-hub
+tokenizers
+safetensors
+
+# Vector / Graph
+networkx
+
+# Speech
+vosk
+sounddevice
+soundfile
+pyttsx3
+
+# Translation
+deep-translator
+
+# Visualization
+matplotlib
+wordcloud
+
+# GUI
+customtkinter
+
+# Image Processing
+Pillow
