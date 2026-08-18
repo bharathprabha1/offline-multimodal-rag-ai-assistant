@@ -2,129 +2,118 @@ from llama_cpp import Llama
 import os
 import time
 
-# ============================================================
-# LOCAL LLAMA.CPP PERFORMANCE TEST
-# Designed for:
-#   Intel i5-12450H
-#   16 GB RAM
-#   RTX 3050 4 GB
-# ============================================================
-
 os.environ["LLAMA_CPP_LOG_LEVEL"] = "error"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 MODEL_PATH = os.path.join(
     BASE_DIR,
     "models",
     "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 )
 
-print("=" * 60)
-print("       LOCAL MISTRAL 7B PERFORMANCE TEST")
-print("=" * 60)
-
-print(f"Model: {MODEL_PATH}")
+print("=" * 65)
+print("       RTX 3050 CUDA MISTRAL 7B BENCHMARK")
+print("=" * 65)
 
 if not os.path.isfile(MODEL_PATH):
-    print()
-    print("❌ MODEL NOT FOUND")
+    print("❌ Model not found:")
     print(MODEL_PATH)
     raise SystemExit(1)
 
-print("✅ Model file found")
+print("✅ Model found")
+print(f"Path: {MODEL_PATH}")
 print()
 
-try:
-    print("Loading model...")
-    start_load = time.time()
+# ------------------------------------------------------------
+# Load model
+# ------------------------------------------------------------
 
+print("Loading Mistral 7B with GPU offloading...")
+
+start_load = time.perf_counter()
+
+try:
     llm = Llama(
         model_path=MODEL_PATH,
 
-        # Keep memory requirements reasonable
+        # Small context for this benchmark
         n_ctx=1024,
 
-        # Your CPU has 12 logical threads.
-        # Start conservatively.
+        # CPU threads
         n_threads=8,
 
-        # Current installation is CPU based.
-        n_gpu_layers=0,
+        # Start with moderate GPU offloading.
+        # We will optimize this later for your 4 GB VRAM.
+        n_gpu_layers=20,
 
-        verbose=False
+        verbose=True
     )
-
-    load_time = time.time() - start_load
-
-    print()
-    print("✅ MODEL LOADED")
-    print(f"Load time: {load_time:.2f} seconds")
-    print()
-
 except Exception as e:
     print()
-    print("❌ MODEL LOADING FAILED")
+    print("❌ MODEL LOAD FAILED")
     print(e)
     raise SystemExit(1)
 
+load_time = time.perf_counter() - start_load
 
-# ============================================================
-# VERY SMALL GENERATION TEST
-# ============================================================
+print()
+print("=" * 65)
+print("✅ MODEL LOADED")
+print("=" * 65)
+print(f"Load time: {load_time:.2f} seconds")
+print()
 
-print("=" * 60)
-print("STARTING INFERENCE TEST")
-print("=" * 60)
+# ------------------------------------------------------------
+# Inference benchmark
+# ------------------------------------------------------------
 
 prompt = """You are a local offline AI assistant.
-Answer in one short sentence.
 
-Question: What is artificial intelligence?
+Answer this question in one short sentence:
+
+What is artificial intelligence?
 
 Answer:"""
 
-try:
-    start_generation = time.time()
+print("Running inference...")
+print()
 
+start_generation = time.perf_counter()
+
+try:
     response = llm(
         prompt,
-        max_tokens=20,
+        max_tokens=40,
         temperature=0.1,
         top_p=0.9,
         stop=["</s>", "Question:"],
         echo=False
     )
 
-    generation_time = time.time() - start_generation
+    elapsed = time.perf_counter() - start_generation
 
     answer = response["choices"][0]["text"].strip()
 
     usage = response.get("usage", {})
+    tokens = usage.get("completion_tokens", 0)
 
-    completion_tokens = usage.get("completion_tokens", 0)
-
-    print()
-    print("🤖 AI RESPONSE")
-    print("-" * 60)
+    print("🤖 RESPONSE")
+    print("-" * 65)
     print(answer)
-    print("-" * 60)
+    print("-" * 65)
 
     print()
-    print(f"Generation time : {generation_time:.2f} seconds")
-    print(f"Tokens generated: {completion_tokens}")
+    print(f"Generation time : {elapsed:.2f} seconds")
+    print(f"Tokens generated: {tokens}")
 
-    if completion_tokens > 0:
-        speed = completion_tokens / generation_time
+    if tokens:
+        speed = tokens / elapsed
         print(f"Generation speed: {speed:.2f} tokens/sec")
 
     print()
-    print("✅ INFERENCE TEST PASSED")
-
-except KeyboardInterrupt:
-    print()
-    print("⚠️ Generation was interrupted.")
-    print("The model loaded successfully, but generation was too slow.")
+    print("=" * 65)
+    print("✅ GPU BENCHMARK COMPLETE")
+    print("=" * 65)
 
 except Exception as e:
     print()
@@ -136,8 +125,3 @@ finally:
         del llm
     except Exception:
         pass
-
-print()
-print("=" * 60)
-print("TEST COMPLETE")
-print("=" * 60)
