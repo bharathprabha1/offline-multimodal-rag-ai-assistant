@@ -14,6 +14,7 @@ __pycache__/
 # Virtual Environments
 # -------------------------
 .venv/
+.venv-gpu/
 venv/
 env/
 ENV/
@@ -62,7 +63,7 @@ models/
 # -------------------------
 # Local AI / External Tools
 # -------------------------
-llama_cpp/
+llama_cpp_local/
 vosk/
 vosk-model-*/
 ffmpeg/
