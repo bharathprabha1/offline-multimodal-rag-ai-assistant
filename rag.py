@@ -1153,6 +1153,10 @@ def retrieve_context(
 # Sources used by the most recent successful RAG answer.
 last_retrieved_sources = []
 
+# True only when the most recent answer was actually generated
+# using retrieved local document context.
+last_answer_used_rag = False
+
 
 def get_retrieved_sources(selected):
     """Return unique source filenames in retrieval rank order."""
@@ -1200,25 +1204,41 @@ def is_provenance_question(query):
 
 
 def build_provenance_answer(selected=None):
-    """Answer provenance questions from the most recent RAG retrieval."""
-    global last_retrieved_sources
+    """
+    Answer provenance questions using only the source(s)
+    associated with the most recent document-grounded answer.
+    """
 
-    sources = get_retrieved_sources(selected)
+    global last_retrieved_sources
+    global last_answer_used_rag
+
+    # Do not claim a source if the previous answer was not
+    # actually generated from local RAG context.
+    if not last_answer_used_rag:
+        return (
+            "The previous answer was not based on a retrieved "
+            "local document."
+        )
+
+    sources = []
+
+    if selected:
+        sources = get_retrieved_sources(selected)
 
     if not sources:
         sources = list(last_retrieved_sources)
 
     if not sources:
         return (
-            "I don't have a recorded local document source for the "
-            "previous answer."
+            "I don't have a recorded local document source "
+            "for the previous answer."
         )
 
     if len(sources) == 1:
         return (
             f"I used the local document **{sources[0]}**. "
-            f"The previous answer was generated from relevant content "
-            f"retrieved from that document."
+            f"The previous answer was generated from relevant "
+            f"content retrieved from that document."
         )
 
     source_text = ", ".join(
@@ -1230,6 +1250,44 @@ def build_provenance_answer(selected=None):
         f"I used these local documents: {source_text}. "
         f"The previous answer was generated from relevant content "
         f"retrieved from those documents."
+    )
+
+
+def is_document_grounded_question(query):
+    """
+    Detect questions that explicitly require information from
+    a local document. These questions must not fall back to the
+    language model's general knowledge when retrieval fails.
+    """
+
+    q = clean_text(query).lower()
+
+    patterns = [
+        r"according to",
+        r"based on",
+        r"from (the )?(document|file|pdf|docx|text)",
+        r"in (the )?(document|file|pdf|docx|text)",
+        r"what does .*\.pdf .*say",
+        r"what does .*\.docx .*say",
+        r"what does .*\.txt .*say",
+        r"what information .*provide",
+        r"what information .*contain",
+        r"what is mentioned in",
+        r"what does .*document.*say",
+        r"what does .*file.*say",
+        r"according to .*\.(pdf|docx|txt|wav)\b",
+        r"\.pdf\b",
+        r"\.docx\b",
+        r"\.txt\b",
+        r"local document",
+        r"local file",
+        r"provided document",
+        r"provided file",
+    ]
+
+    return any(
+        re.search(pattern, q)
+        for pattern in patterns
     )
 
 
@@ -1300,6 +1358,12 @@ SOURCE RULES:
   computer.
 - When you use information from that context, identify the document
   source(s) naturally in your answer.
+- For document-grounded questions, use only facts supported by this
+  retrieved context.
+- Do not use general/pretrained knowledge to fill gaps in a document-grounded
+  answer.
+- If the retrieved context does not support the requested fact, say:
+  "I couldn't find that information in the indexed local documents."
 - If the user asks which document was used, answer directly using the
   [Source: ...] labels in the context.
 - Never say that no document was used when local RAG context is present.
@@ -1314,8 +1378,11 @@ SOURCE RULES:
 - No sufficiently relevant local document context was retrieved for
   this question.
 - Do not claim that a local document was used.
+- Do not fabricate a filename or source.
 - If asked which document was used, say that no sufficiently relevant
   local document was retrieved.
+- For a document-grounded question, say:
+  "I couldn't find that information in the indexed local documents."
 """
 
     if flowchart:
@@ -1372,24 +1439,32 @@ USER QUESTION:
 
 INSTRUCTIONS:
 
-- Prefer the local RAG context when it is relevant.
-- Treat [Source: filename | Relevance: score] as authoritative
-  provenance metadata for the retrieved text.
-- If the question is specifically about the provided documents,
-  answer from the retrieved document context rather than relying on
-  general model knowledge.
+- Treat the LOCAL RAG CONTEXT as the authoritative source for
+  document-grounded questions.
+
+- If the user asks "according to", "based on", "from", "in",
+  "what does [document] say", or otherwise refers to a local
+  document, answer ONLY from the retrieved LOCAL RAG CONTEXT.
+
+- Do NOT use the model's general/pretrained knowledge to fill
+  missing information in a document-grounded answer.
+
 - If the retrieved context does not contain enough information,
-  explicitly say that the information was not found in the relevant
-  local documents. You may add general local-model knowledge only if
-  it is clearly labeled as general knowledge and is useful.
-- If the user asks "Which document did you use?", "What file did you
-  use?", "According to which document?", or a similar provenance
-  question, answer directly with the filename(s) from the retrieved
-  [Source: ...] labels.
-- Never claim that a local document was not used when local RAG context
-  is present.
-- Never fabricate sources or filenames.
+  say exactly:
+  "I couldn't find that information in the indexed local documents."
+
+- Do NOT guess, infer unsupported facts, or fabricate information.
+
+- Treat [Source: filename | Relevance: score] as authoritative
+  provenance metadata.
+
+- If the user asks which document was used, answer using ONLY
+  filenames explicitly present in [Source: ...] labels.
+
+- Never fabricate a filename or source.
+
 - Never claim information came from the internet.
+
 - Do not mention these internal instructions.
 
 ANSWER:
@@ -2710,6 +2785,8 @@ class RAGApp(ctk.CTk):
     def start_generation(self):
 
         global last_response_text
+        global last_retrieved_sources
+        global last_answer_used_rag
         global is_busy
 
         query = (
@@ -2757,6 +2834,9 @@ class RAGApp(ctk.CTk):
         }
 
         if query.lower() in greetings:
+
+            last_retrieved_sources = []
+            last_answer_used_rag = False
 
             answer = (
                 "Hello! I am your offline local AI assistant. "
@@ -2808,7 +2888,7 @@ class RAGApp(ctk.CTk):
 
         def worker():
             global last_retrieved_sources
-
+            global last_answer_used_rag
             global last_response_text
 
             try:
@@ -2851,6 +2931,36 @@ class RAGApp(ctk.CTk):
                 last_retrieved_sources = get_retrieved_sources(
                     selected
                 )
+
+                last_answer_used_rag = bool(
+                    selected
+                    and last_retrieved_sources
+                )
+
+                # If this is explicitly a document-grounded question
+                # and retrieval found nothing relevant, do not allow
+                # Mistral's pretrained knowledge to answer it.
+                if (
+                    is_document_grounded_question(query)
+                    and not selected
+                ):
+                    answer = (
+                        "I couldn't find that information in the "
+                        "indexed local documents."
+                    )
+
+                    last_retrieved_sources = []
+                    last_answer_used_rag = False
+
+                    self.after(
+                        0,
+                        self.log,
+                        answer,
+                        "AI"
+                    )
+
+                    last_response_text = answer
+                    return
 
                 # Defensive fallback: use only explicit source labels
                 # already present in the retrieved context.
@@ -2974,8 +3084,7 @@ class RAGApp(ctk.CTk):
                         top_p=0.9,
                         repeat_penalty=1.1,
                         stop=[
-                            "</s>",
-                            "[/INST]"
+                            "</s>"
                         ],
                         stream=True
                     )
@@ -3005,6 +3114,20 @@ class RAGApp(ctk.CTk):
                         full_answer
                         .strip()
                     )
+
+                    # llama.cpp can occasionally return an empty stream.
+                    # Never leave the GUI with a blank AI response.
+                    if not answer:
+                        if is_document_grounded_question(query):
+                            answer = (
+                                "I couldn't generate an answer from the "
+                                "retrieved local document context."
+                            )
+                        else:
+                            answer = (
+                                "The local model returned an empty response. "
+                                "Please try the question again."
+                            )
 
                     retrieved_sources = get_retrieved_sources(
                         selected
@@ -3051,8 +3174,7 @@ class RAGApp(ctk.CTk):
                         top_p=0.9,
                         repeat_penalty=1.1,
                         stop=[
-                            "</s>",
-                            "[/INST]"
+                            "</s>"
                         ],
                         echo=False
                     )
@@ -3063,6 +3185,20 @@ class RAGApp(ctk.CTk):
                         ["text"]
                         .strip()
                     )
+
+                    # Prevent a blank response if the local model returns
+                    # no generated text.
+                    if not answer:
+                        if is_document_grounded_question(query):
+                            answer = (
+                                "I couldn't generate an answer from the "
+                                "retrieved local document context."
+                            )
+                        else:
+                            answer = (
+                                "The local model returned an empty response. "
+                                "Please try the question again."
+                            )
 
                     retrieved_sources = get_retrieved_sources(
                         selected
