@@ -48,7 +48,7 @@ try:
     from vosk import Model, KaldiRecognizer
 
     from sentence_transformers import SentenceTransformer
-    from sklearn.metrics.pairwise import cosine_similarity
+    import faiss
 
     # IMPORTANT:
     # This must be the CUDA-enabled llama_cpp package
@@ -109,10 +109,10 @@ HISTORY_FILE = os.path.join(
 
 # Your RTX 3050 has 4 GB VRAM.
 # 20 layers was successfully tested on your machine.
-GPU_LAYERS = 20
+GPU_LAYERS = 16
 
 # Conservative settings for 4 GB VRAM.
-CONTEXT_SIZE = 2048
+CONTEXT_SIZE = 1536
 
 CPU_THREADS = 8
 
@@ -136,6 +136,10 @@ llm = None
 chunks = []
 
 embeddings = None
+
+# FAISS inner-product index over normalized embeddings.
+# For normalized vectors, inner product == cosine similarity.
+faiss_index = None
 
 last_response_text = ""
 
@@ -617,12 +621,49 @@ def load_embedder(status_callback=None):
 # CACHE LOADING
 # ============================================================
 
+def build_faiss_index(vectors):
+    """
+    Build a FAISS inner-product index from embedding vectors.
+
+    Vectors are L2-normalized first, so inner-product scores are
+    equivalent to cosine similarity scores.
+    """
+    global faiss_index
+
+    if vectors is None:
+        faiss_index = None
+        return None
+
+    matrix = np.asarray(
+        vectors,
+        dtype=np.float32
+    )
+
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        faiss_index = None
+        return None
+
+    faiss.normalize_L2(matrix)
+
+    dimension = int(matrix.shape[1])
+
+    index = faiss.IndexFlatIP(
+        dimension
+    )
+
+    index.add(matrix)
+
+    faiss_index = index
+
+    return faiss_index
+
+
 def load_cached_memory(
     target_folder,
     status_callback=None
 ):
 
-    global chunks, embeddings
+    global chunks, embeddings, faiss_index
 
     cache_dir = os.path.join(
         target_folder,
@@ -637,6 +678,11 @@ def load_cached_memory(
     embeddings_file = os.path.join(
         cache_dir,
         "embeddings.npy"
+    )
+
+    faiss_file = os.path.join(
+        cache_dir,
+        "faiss.index"
     )
 
     if not (
@@ -663,9 +709,11 @@ def load_cached_memory(
         if not cached_chunks:
             return False
 
-        if len(cached_chunks) != len(
-            cached_embeddings
+        if (
+            cached_embeddings.ndim != 2
+            or len(cached_chunks) != len(cached_embeddings)
         ):
+
             print(
                 "Cache size mismatch."
             )
@@ -674,12 +722,77 @@ def load_cached_memory(
 
         chunks = cached_chunks
 
-        embeddings = cached_embeddings
+        embeddings = np.asarray(
+            cached_embeddings,
+            dtype=np.float32
+        )
+
+        loaded_index = None
+
+        if os.path.exists(faiss_file):
+
+            try:
+
+                loaded_index = faiss.read_index(
+                    faiss_file
+                )
+
+                if (
+                    loaded_index.ntotal != len(chunks)
+                    or loaded_index.d != embeddings.shape[1]
+                ):
+
+                    print(
+                        "FAISS cache mismatch. Rebuilding index."
+                    )
+
+                    loaded_index = None
+
+            except Exception as e:
+
+                print(
+                    "FAISS cache load error:",
+                    e
+                )
+
+                loaded_index = None
+
+        if loaded_index is None:
+
+            loaded_index = build_faiss_index(
+                embeddings
+            )
+
+            if loaded_index is None:
+                return False
+
+            try:
+
+                faiss.write_index(
+                    loaded_index,
+                    faiss_file
+                )
+
+            except Exception as e:
+
+                print(
+                    "FAISS cache save warning:",
+                    e
+                )
+
+        else:
+
+            faiss_index = loaded_index
+
+        # Keep the in-memory NumPy copy normalized as well.
+        faiss.normalize_L2(
+            embeddings
+        )
 
         if status_callback:
 
             status_callback(
-                f"Loaded cached memory: "
+                f"Loaded FAISS memory: "
                 f"{len(chunks)} segments."
             )
 
@@ -691,6 +804,8 @@ def load_cached_memory(
             "Cache load error:",
             e
         )
+
+        faiss_index = None
 
         return False
 
@@ -706,6 +821,7 @@ def run_ingestion(
 
     global chunks
     global embeddings
+    global faiss_index
 
     if not load_embedder(
         status_callback
@@ -837,9 +953,29 @@ def run_ingestion(
             convert_to_numpy=True
         )
 
+        vectors = np.asarray(
+            vectors,
+            dtype=np.float32
+        )
+
+        # Normalize vectors so FAISS inner product is cosine similarity.
+        faiss.normalize_L2(
+            vectors
+        )
+
+        new_faiss_index = faiss.IndexFlatIP(
+            int(vectors.shape[1])
+        )
+
+        new_faiss_index.add(
+            vectors
+        )
+
         chunks = all_chunks
 
         embeddings = vectors
+
+        faiss_index = new_faiss_index
 
         cache_dir = os.path.join(
             target_folder,
@@ -872,6 +1008,14 @@ def run_ingestion(
                 "embeddings.npy"
             ),
             vectors
+        )
+
+        faiss.write_index(
+            faiss_index,
+            os.path.join(
+                cache_dir,
+                "faiss.index"
+            )
         )
 
         status_callback(
@@ -1063,9 +1207,10 @@ def retrieve_context(
     top_k=TOP_K
 ):
 
+    global faiss_index
+
     if (
         embedder is None
-        or embeddings is None
         or not chunks
     ):
 
@@ -1073,40 +1218,74 @@ def retrieve_context(
 
     try:
 
+        # Build an index lazily for older caches created before FAISS.
+        if faiss_index is None:
+
+            if embeddings is None:
+
+                return [], (
+                    "No local documents have been indexed."
+                )
+
+            faiss_index = build_faiss_index(
+                embeddings
+            )
+
+            if faiss_index is None:
+
+                return [], (
+                    "Local vector index could not be created."
+                )
+
         query_vector = embedder.encode(
             [query],
             convert_to_numpy=True
         )
 
-        scores = cosine_similarity(
+        query_vector = np.asarray(
             query_vector,
-            embeddings
-        )[0]
+            dtype=np.float32
+        )
 
-        ranked_indices = np.argsort(
-            scores
-        )[::-1]
+        # Normalized query + normalized document vectors:
+        # FAISS inner product == cosine similarity.
+        faiss.normalize_L2(
+            query_vector
+        )
+
+        search_k = min(
+            max(int(top_k), 1),
+            len(chunks)
+        )
+
+        scores, indices = faiss_index.search(
+            query_vector,
+            search_k
+        )
 
         selected = []
 
-        for index in ranked_indices:
+        for score, index in zip(
+            scores[0],
+            indices[0]
+        ):
 
-            score = float(
-                scores[index]
-            )
+            index = int(index)
+
+            if index < 0:
+                continue
+
+            score = float(score)
 
             if score < SIMILARITY_THRESHOLD:
-                break
+                continue
 
             selected.append(
                 (
-                    int(index),
+                    index,
                     score
                 )
             )
-
-            if len(selected) >= top_k:
-                break
 
         if not selected:
 
@@ -1137,7 +1316,7 @@ def retrieve_context(
     except Exception as e:
 
         print(
-            "Retrieval error:",
+            "FAISS retrieval error:",
             e
         )
 
@@ -2821,25 +3000,70 @@ class RAGApp(ctk.CTk):
         )
 
         # ----------------------------------------------------
-        # Local greetings
+        # LOCAL GREETING HANDLING
+        # ----------------------------------------------------
+        # Handle greetings BEFORE RAG retrieval.
+        # Accept natural repeated forms such as hi/hiiiiii/hello/hey.
+        # Do not treat a longer question as a greeting.
         # ----------------------------------------------------
 
-        greetings = {
-            "hi",
-            "hello",
-            "hlo",
-            "hey",
-            "hii",
-            "hello ai"
-        }
+        normalized_query = (
+            query.lower()
+            .strip()
+        )
 
-        if query.lower() in greetings:
+        greeting_patterns = [
+            r"^h+i+$",
+            r"^h+e+l+l+o+$",
+            r"^h+e+y+$",
+            r"^h+l+o+$",
+            r"^hey\s+ai$",
+            r"^hello\s+ai$",
+            r"^hi\s+ai$",
+            r"^good\s+morning$",
+            r"^good\s+afternoon$",
+            r"^good\s+evening$",
+        ]
 
+        is_greeting = any(
+            re.fullmatch(
+                pattern,
+                normalized_query
+            )
+            for pattern in greeting_patterns
+        )
+
+        if is_greeting:
+
+            # A greeting is not document-grounded.
+            # Clear previous RAG provenance so a later provenance
+            # question cannot incorrectly attribute the greeting
+            # to a local document.
             last_retrieved_sources = []
             last_answer_used_rag = False
 
+            # Respond naturally to the specific greeting.
+            if normalized_query == "good morning":
+                greeting_response = "Good morning!"
+
+            elif normalized_query == "good afternoon":
+                greeting_response = "Good afternoon!"
+
+            elif normalized_query == "good evening":
+                greeting_response = "Good evening!"
+
+            elif normalized_query.startswith("hello"):
+                greeting_response = "Hello!"
+
+            elif normalized_query.startswith("hey"):
+                greeting_response = "Hey!"
+
+            else:
+                greeting_response = "Hi!"
+
             answer = (
-                "Hello! I am your offline local AI assistant. "
+                f"{greeting_response} "
+                "I am your offline local AI assistant. "
                 "I do not have internet access."
             )
 
