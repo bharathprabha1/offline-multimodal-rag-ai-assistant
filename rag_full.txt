@@ -1,0 +1,2151 @@
+﻿# ============================================================
+# OFFLINE MULTIMODAL RAG AI ASSISTANT
+# rag.py
+#
+# Main GUI + compatibility bridge for modular core/
+# ============================================================
+
+import os
+import sys
+import threading
+import queue
+
+from tkinter import messagebox, filedialog
+
+
+# ============================================================
+# OFFLINE ENVIRONMENT
+# ============================================================
+
+os.environ.setdefault(
+    "TOKENIZERS_PARALLELISM",
+    "false"
+)
+
+os.environ.setdefault(
+    "LLAMA_CPP_LOG_LEVEL",
+    "error"
+)
+
+
+# ============================================================
+# CUSTOMTKINTER
+# ============================================================
+
+try:
+    import customtkinter as ctk
+
+except ImportError:
+
+    print("=" * 70)
+    print("ERROR: customtkinter is not installed.")
+    print()
+    print("Install it with:")
+    print("python -m pip install customtkinter")
+    print("=" * 70)
+
+    sys.exit(1)
+
+
+# ============================================================
+# MODULAR CORE
+# ============================================================
+
+try:
+
+    from core import config
+    from core import ingestion
+    from core import retrieval
+    from core import answer_engine
+    from core import document_processor
+
+except Exception as e:
+
+    print("=" * 70)
+    print("CRITICAL CORE IMPORT ERROR")
+    print("=" * 70)
+    print(e)
+    print()
+    print("Check your core/ folder.")
+    sys.exit(1)
+
+
+# ============================================================
+# OPTIONAL VISUALIZER
+# ============================================================
+
+try:
+
+    import rag_visualizer
+
+    VISUALIZER_AVAILABLE = True
+
+except Exception:
+
+    rag_visualizer = None
+    VISUALIZER_AVAILABLE = False
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = os.path.dirname(
+    os.path.abspath(__file__)
+)
+
+
+MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "models",
+    "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+)
+
+
+CONTEXT_SIZE = getattr(
+    config,
+    "CONTEXT_SIZE",
+    1536
+)
+
+
+GPU_LAYERS = getattr(
+    config,
+    "GPU_LAYERS",
+    16
+)
+
+
+CPU_THREADS = getattr(
+    config,
+    "CPU_THREADS",
+    8
+)
+
+
+MAX_OUTPUT_TOKENS = getattr(
+    config,
+    "MAX_OUTPUT_TOKENS",
+    96
+)
+
+
+TOP_K = getattr(
+    config,
+    "TOP_K",
+    4
+)
+
+
+SIMILARITY_THRESHOLD = getattr(
+    config,
+    "SIMILARITY_THRESHOLD",
+    0.25
+)
+
+
+# ============================================================
+# GLOBAL COMPATIBILITY STATE
+# ============================================================
+
+embedder = None
+
+llm = None
+
+chunks = []
+
+embeddings = None
+
+faiss_index = None
+
+last_response_text = ""
+
+current_engine = None
+
+is_speaking = False
+
+is_listening = False
+
+audio_queue = queue.Queue()
+
+is_busy = False
+
+is_processing = False
+
+is_generating = False
+
+
+# ============================================================
+# EVENTS
+# ============================================================
+
+generation_stop_event = threading.Event()
+
+processing_stop_event = threading.Event()
+
+
+# ============================================================
+# SELECTED FOLDER
+# ============================================================
+
+selected_folder = ""
+
+
+# ============================================================
+# GENERATION LOCK
+# ============================================================
+
+generation_lock = threading.Lock()
+
+
+# ============================================================
+# CORE STATE
+# ============================================================
+
+CORE_STATE = {
+    "chunks": [],
+    "embeddings": None,
+    "faiss_index": None,
+    "embedder": None,
+}
+
+
+# ============================================================
+# STATE SYNCHRONIZATION
+# ============================================================
+
+def sync_core_rag_state():
+
+    global chunks
+    global embeddings
+    global faiss_index
+    global embedder
+
+    # --------------------------------------------------------
+    # Read actual state from core.ingestion
+    # --------------------------------------------------------
+
+    chunks = getattr(
+        ingestion,
+        "chunks",
+        []
+    )
+
+    embeddings = getattr(
+        ingestion,
+        "embeddings",
+        None
+    )
+
+    faiss_index = getattr(
+        ingestion,
+        "faiss_index",
+        None
+    )
+
+    embedder = getattr(
+        ingestion,
+        "embedder",
+        None
+    )
+
+    # --------------------------------------------------------
+    # Update shared state
+    # --------------------------------------------------------
+
+    CORE_STATE["chunks"] = chunks
+
+    CORE_STATE["embeddings"] = embeddings
+
+    CORE_STATE["faiss_index"] = faiss_index
+
+    CORE_STATE["embedder"] = embedder
+
+
+# ============================================================
+# PUSH STATE INTO CORE
+# ============================================================
+
+def push_core_rag_state():
+
+    global chunks
+    global embeddings
+    global faiss_index
+    global embedder
+
+    ingestion.chunks = chunks
+
+    ingestion.embeddings = embeddings
+
+    ingestion.faiss_index = faiss_index
+
+    ingestion.embedder = embedder
+
+    CORE_STATE["chunks"] = chunks
+
+    CORE_STATE["embeddings"] = embeddings
+
+    CORE_STATE["faiss_index"] = faiss_index
+
+    CORE_STATE["embedder"] = embedder
+
+
+# ============================================================
+# EMBEDDER
+# ============================================================
+
+def load_embedder(
+    status_callback=None
+):
+
+    global embedder
+
+    try:
+
+        if (
+            embedder is not None
+            and callable(
+                getattr(
+                    embedder,
+                    "encode",
+                    None
+                )
+            )
+        ):
+
+            return embedder
+
+        if status_callback:
+
+            status_callback(
+                "Loading local embedding model..."
+            )
+
+        loaded = ingestion.load_embedder(
+            status_callback=status_callback
+        )
+
+        # ----------------------------------------------------
+        # load_embedder normally returns SentenceTransformer
+        # ----------------------------------------------------
+
+        if loaded is not None:
+
+            if callable(
+                getattr(
+                    loaded,
+                    "encode",
+                    None
+                )
+            ):
+
+                embedder = loaded
+
+        # ----------------------------------------------------
+        # Also check module-level state
+        # ----------------------------------------------------
+
+        if embedder is None:
+
+            embedder = getattr(
+                ingestion,
+                "embedder",
+                None
+            )
+
+        if embedder is None:
+
+            raise RuntimeError(
+                "Embedding model could not be loaded."
+            )
+
+        ingestion.embedder = embedder
+
+        sync_core_rag_state()
+
+        if status_callback:
+
+            status_callback(
+                "Embedding model ready."
+            )
+
+        return embedder
+
+    except Exception as e:
+
+        if status_callback:
+
+            status_callback(
+                f"Embedding model error: {e}"
+            )
+
+        print(
+            "Embedding model error:",
+            e
+        )
+
+        raise
+
+
+# ============================================================
+# DOCUMENT PROCESSING
+# ============================================================
+
+def extract_pdf(path):
+
+    return document_processor.extract_pdf(
+        path
+    )
+
+
+def extract_docx(path):
+
+    return document_processor.extract_docx(
+        path
+    )
+
+
+def extract_txt(path):
+
+    return document_processor.extract_txt(
+        path
+    )
+
+
+def process_audio(path):
+
+    # --------------------------------------------------------
+    # Audio support if implemented in document_processor
+    # --------------------------------------------------------
+
+    if hasattr(
+        document_processor,
+        "process_audio"
+    ):
+
+        return document_processor.process_audio(
+            path
+        )
+
+    # --------------------------------------------------------
+    # If audio processor is unavailable, return empty text.
+    # This keeps ingestion compatible with core.ingestion.
+    # --------------------------------------------------------
+
+    print(
+        "Audio processing is not available."
+    )
+
+    return ""
+
+
+def create_chunks(
+    text,
+    source,
+    chunk_size=None,
+    overlap=None
+):
+
+    function = getattr(
+        document_processor,
+        "create_chunks",
+        None
+    )
+
+    # --------------------------------------------------------
+    # Preferred modular implementation
+    # --------------------------------------------------------
+
+    if function is not None:
+
+        try:
+
+            if (
+                chunk_size is not None
+                and overlap is not None
+            ):
+
+                return function(
+                    text,
+                    source,
+                    chunk_size=chunk_size,
+                    overlap=overlap
+                )
+
+            return function(
+                text,
+                source
+            )
+
+        except TypeError:
+
+            try:
+
+                return function(
+                    text,
+                    source
+                )
+
+            except TypeError:
+
+                return function(
+                    text
+                )
+
+    # --------------------------------------------------------
+    # Safe fallback chunker
+    # --------------------------------------------------------
+
+    if not text:
+
+        return []
+
+    text = str(text).strip()
+
+    if not text:
+
+        return []
+
+    if chunk_size is None:
+
+        chunk_size = 500
+
+    if overlap is None:
+
+        overlap = 80
+
+    words = text.split()
+
+    if not words:
+
+        return []
+
+    result = []
+
+    start = 0
+
+    while start < len(words):
+
+        end = min(
+            start + chunk_size,
+            len(words)
+        )
+
+        chunk_text = " ".join(
+            words[start:end]
+        )
+
+        if chunk_text:
+
+            result.append(
+                {
+                    "source": source,
+                    "text": chunk_text
+                }
+            )
+
+        if end >= len(words):
+
+            break
+
+        start = max(
+            end - overlap,
+            start + 1
+        )
+
+    return result
+
+
+# ============================================================
+# FAISS
+# ============================================================
+
+def build_faiss_index(
+    vectors
+):
+
+    return ingestion.build_faiss_index(
+        vectors
+    )
+
+
+# ============================================================
+# CACHE
+# ============================================================
+
+def load_cached_memory(
+    target_folder,
+    status_callback=None
+):
+
+    global chunks
+    global embeddings
+    global faiss_index
+    global embedder
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # core.ingestion requires a real state dictionary.
+    # --------------------------------------------------------
+
+    CORE_STATE["chunks"] = chunks
+
+    CORE_STATE["embeddings"] = embeddings
+
+    CORE_STATE["faiss_index"] = faiss_index
+
+    CORE_STATE["embedder"] = embedder
+
+    try:
+
+        success = ingestion.load_cached_memory(
+            target_folder=target_folder,
+            status_callback=status_callback,
+            state=CORE_STATE
+        )
+
+        if success:
+
+            chunks = CORE_STATE.get(
+                "chunks",
+                []
+            )
+
+            embeddings = CORE_STATE.get(
+                "embeddings"
+            )
+
+            faiss_index = CORE_STATE.get(
+                "faiss_index"
+            )
+
+            embedder = CORE_STATE.get(
+                "embedder",
+                embedder
+            )
+
+            # ------------------------------------------------
+            # Critical retrieval synchronization
+            # ------------------------------------------------
+
+            ingestion.chunks = chunks
+
+            ingestion.embeddings = embeddings
+
+            ingestion.faiss_index = faiss_index
+
+            ingestion.embedder = embedder
+
+            sync_core_rag_state()
+
+        return bool(success)
+
+    except Exception as e:
+
+        print(
+            "Cache load error:",
+            e
+        )
+
+        if status_callback:
+
+            status_callback(
+                f"Cache load error: {e}"
+            )
+
+        return False
+
+
+# ============================================================
+# INGESTION
+# ============================================================
+
+def run_ingestion(
+    target_folder,
+    status_callback=None,
+    stop_event=None
+):
+
+    global is_processing
+    global chunks
+    global embeddings
+    global faiss_index
+    global embedder
+
+    if stop_event is None:
+
+        stop_event = processing_stop_event
+
+    if status_callback is None:
+
+        status_callback = (
+            lambda message: None
+        )
+
+    processing_stop_event.clear()
+
+    is_processing = True
+
+    try:
+
+        # ----------------------------------------------------
+        # Validate folder
+        # ----------------------------------------------------
+
+        if not target_folder:
+
+            raise ValueError(
+                "No document folder was selected."
+            )
+
+        if not os.path.isdir(
+            target_folder
+        ):
+
+            raise FileNotFoundError(
+                f"Document folder does not exist:\n"
+                f"{target_folder}"
+            )
+
+        # ----------------------------------------------------
+        # Load embedder
+        # ----------------------------------------------------
+
+        if (
+            embedder is None
+            or not callable(
+                getattr(
+                    embedder,
+                    "encode",
+                    None
+                )
+            )
+        ):
+
+            embedder = load_embedder(
+                status_callback
+            )
+
+        # ----------------------------------------------------
+        # Build complete state dictionary
+        # ----------------------------------------------------
+
+        CORE_STATE["chunks"] = chunks
+
+        CORE_STATE["embeddings"] = embeddings
+
+        CORE_STATE["faiss_index"] = faiss_index
+
+        CORE_STATE["embedder"] = embedder
+
+        # ----------------------------------------------------
+        # Synchronize core before processing
+        # ----------------------------------------------------
+
+        push_core_rag_state()
+
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # core.ingestion.run_ingestion() requires:
+        #
+        # state
+        # load_embedder
+        # extract_pdf
+        # extract_docx
+        # extract_txt
+        # process_audio
+        # create_chunks
+        # embedder
+        # ----------------------------------------------------
+
+        success = ingestion.run_ingestion(
+
+            target_folder=target_folder,
+
+            status_callback=status_callback,
+
+            stop_event=stop_event,
+
+            state=CORE_STATE,
+
+            load_embedder=load_embedder,
+
+            extract_pdf=extract_pdf,
+
+            extract_docx=extract_docx,
+
+            extract_txt=extract_txt,
+
+            process_audio=process_audio,
+
+            create_chunks=create_chunks,
+
+            embedder=embedder
+        )
+
+        # ----------------------------------------------------
+        # Copy state back from modular core
+        # ----------------------------------------------------
+
+        chunks = CORE_STATE.get(
+            "chunks",
+            getattr(
+                ingestion,
+                "chunks",
+                []
+            )
+        )
+
+        embeddings = CORE_STATE.get(
+            "embeddings",
+            getattr(
+                ingestion,
+                "embeddings",
+                None
+            )
+        )
+
+        faiss_index = CORE_STATE.get(
+            "faiss_index",
+            getattr(
+                ingestion,
+                "faiss_index",
+                None
+            )
+        )
+
+        embedder = CORE_STATE.get(
+            "embedder",
+            getattr(
+                ingestion,
+                "embedder",
+                embedder
+            )
+        )
+
+        # ----------------------------------------------------
+        # CRITICAL:
+        # Retrieval.py reads ingestion.chunks directly.
+        # ----------------------------------------------------
+
+        ingestion.chunks = chunks
+
+        ingestion.embeddings = embeddings
+
+        ingestion.faiss_index = faiss_index
+
+        ingestion.embedder = embedder
+
+        sync_core_rag_state()
+
+        if success:
+
+            status_callback(
+                "Ingestion complete: "
+                f"{len(chunks)} chunks indexed."
+            )
+
+        return bool(success)
+
+    except Exception as e:
+
+        error_message = (
+            f"Processing error: {e}"
+        )
+
+        print(
+            error_message
+        )
+
+        try:
+
+            status_callback(
+                error_message
+            )
+
+        except Exception:
+            pass
+
+        return False
+
+    finally:
+
+        is_processing = False
+
+
+# ============================================================
+# RETRIEVAL
+# ============================================================
+
+def retrieve_context(
+    query,
+    top_k=TOP_K,
+    similarity_threshold=SIMILARITY_THRESHOLD
+):
+
+    # --------------------------------------------------------
+    # Always synchronize before retrieval.
+    # --------------------------------------------------------
+
+    sync_core_rag_state()
+
+    return retrieval.retrieve_context(
+        query,
+        top_k=top_k,
+        similarity_threshold=similarity_threshold
+    )
+
+
+def get_retrieved_sources(
+    selected
+):
+
+    return retrieval.get_retrieved_sources(
+        selected
+    )
+
+
+def normalize_source_name(
+    value
+):
+
+    return retrieval.normalize_source_name(
+        value
+    )
+
+
+def remove_relevance_metadata(
+    text
+):
+
+    return retrieval.remove_relevance_metadata(
+        text
+    )
+
+
+# ============================================================
+# ANSWER ENGINE
+# ============================================================
+
+def generate_answer(
+    prompt,
+    context="",
+    **kwargs
+):
+
+    return answer_engine.generate_answer(
+        prompt,
+        context,
+        **kwargs
+    )
+
+
+# ============================================================
+# STREAMING COMPATIBILITY
+# ============================================================
+
+def generate_stream(
+    prompt,
+    context="",
+    **kwargs
+):
+
+    function = getattr(
+        answer_engine,
+        "generate_stream",
+        None
+    )
+
+    if function is not None:
+
+        return function(
+            prompt,
+            context,
+            **kwargs
+        )
+
+    # --------------------------------------------------------
+    # Fallback
+    # --------------------------------------------------------
+
+    answer = generate_answer(
+        prompt,
+        context,
+        **kwargs
+    )
+
+    def fallback_generator():
+
+        yield answer
+
+    return fallback_generator()
+
+
+# ============================================================
+# GUI THEME
+# ============================================================
+
+ctk.set_appearance_mode(
+    "Dark"
+)
+
+ctk.set_default_color_theme(
+    "blue"
+)
+
+
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
+
+class RAGApp(
+    ctk.CTk
+):
+
+    def __init__(
+        self
+    ):
+
+        super().__init__()
+
+        self.title(
+            "Offline Multimodal RAG AI Assistant"
+        )
+
+        self.geometry(
+            "1200x760"
+        )
+
+        self.minsize(
+            950,
+            650
+        )
+
+        self.selected_folder = ""
+
+        self.local_busy = False
+
+        self.build_ui()
+
+        self.startup_message()
+
+
+    # ========================================================
+    # UI
+    # ========================================================
+
+    def build_ui(
+        self
+    ):
+
+        # ----------------------------------------------------
+        # GRID
+        # ----------------------------------------------------
+
+        self.grid_columnconfigure(
+            1,
+            weight=1
+        )
+
+        self.grid_rowconfigure(
+            1,
+            weight=1
+        )
+
+        # ----------------------------------------------------
+        # HEADER
+        # ----------------------------------------------------
+
+        self.header = ctk.CTkFrame(
+            self,
+            corner_radius=0
+        )
+
+        self.header.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew"
+        )
+
+        self.header.grid_columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.title_label = ctk.CTkLabel(
+            self.header,
+            text="OFFLINE MULTIMODAL RAG AI ASSISTANT",
+            font=ctk.CTkFont(
+                size=21,
+                weight="bold"
+            )
+        )
+
+        self.title_label.grid(
+            row=0,
+            column=0,
+            padx=20,
+            pady=(14, 2),
+            sticky="w"
+        )
+
+        self.subtitle_label = ctk.CTkLabel(
+            self.header,
+            text=(
+                "Local FAISS Retrieval  â€¢  "
+                "Local SentenceTransformer  â€¢  "
+                "Local Mistral 7B"
+            ),
+            font=ctk.CTkFont(
+                size=12
+            )
+        )
+
+        self.subtitle_label.grid(
+            row=1,
+            column=0,
+            padx=20,
+            pady=(0, 14),
+            sticky="w"
+        )
+
+        # ----------------------------------------------------
+        # SIDEBAR
+        # ----------------------------------------------------
+
+        self.sidebar = ctk.CTkFrame(
+            self,
+            width=280
+        )
+
+        self.sidebar.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=(12, 6),
+            pady=12
+        )
+
+        self.sidebar.grid_propagate(
+            False
+        )
+
+        # ----------------------------------------------------
+        # DOCUMENT SECTION
+        # ----------------------------------------------------
+
+        self.doc_title = ctk.CTkLabel(
+            self.sidebar,
+            text="DOCUMENTS",
+            font=ctk.CTkFont(
+                size=15,
+                weight="bold"
+            )
+        )
+
+        self.doc_title.pack(
+            padx=18,
+            pady=(20, 10),
+            anchor="w"
+        )
+
+        self.select_button = ctk.CTkButton(
+            self.sidebar,
+            text="Select Document Folder",
+            command=self.select_folder,
+            height=40
+        )
+
+        self.select_button.pack(
+            padx=18,
+            pady=6,
+            fill="x"
+        )
+
+        self.process_button = ctk.CTkButton(
+            self.sidebar,
+            text="Process Documents",
+            command=self.start_processing,
+            height=40
+        )
+
+        self.process_button.pack(
+            padx=18,
+            pady=6,
+            fill="x"
+        )
+
+        self.folder_label = ctk.CTkLabel(
+            self.sidebar,
+            text="No folder selected",
+            wraplength=235,
+            justify="left",
+            anchor="w"
+        )
+
+        self.folder_label.pack(
+            padx=18,
+            pady=(12, 20),
+            fill="x"
+        )
+
+        # ----------------------------------------------------
+        # STATUS
+        # ----------------------------------------------------
+
+        self.status_title = ctk.CTkLabel(
+            self.sidebar,
+            text="SYSTEM STATUS",
+            font=ctk.CTkFont(
+                size=15,
+                weight="bold"
+            )
+        )
+
+        self.status_title.pack(
+            padx=18,
+            pady=(15, 8),
+            anchor="w"
+        )
+
+        self.status_label = ctk.CTkLabel(
+            self.sidebar,
+            text="Ready",
+            wraplength=235,
+            justify="left",
+            anchor="w"
+        )
+
+        self.status_label.pack(
+            padx=18,
+            pady=5,
+            fill="x"
+        )
+
+        # ----------------------------------------------------
+        # INFO
+        # ----------------------------------------------------
+
+        self.info_label = ctk.CTkLabel(
+            self.sidebar,
+            text=(
+                "Supported documents:\n"
+                "â€¢ PDF\n"
+                "â€¢ DOCX\n"
+                "â€¢ TXT\n"
+                "â€¢ WAV (if available)\n\n"
+                "Retrieval: FAISS\n"
+                "Embedding: all-MiniLM-L6-v2\n"
+                "LLM: Mistral 7B GGUF\n"
+                "Runtime: Offline"
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=235
+        )
+
+        self.info_label.pack(
+            padx=18,
+            pady=(20, 10),
+            fill="x"
+        )
+
+        # ----------------------------------------------------
+        # MAIN CHAT AREA
+        # ----------------------------------------------------
+
+        self.main_frame = ctk.CTkFrame(
+            self
+        )
+
+        self.main_frame.grid(
+            row=1,
+            column=1,
+            sticky="nsew",
+            padx=(6, 12),
+            pady=12
+        )
+
+        self.main_frame.grid_rowconfigure(
+            0,
+            weight=1
+        )
+
+        self.main_frame.grid_columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.chat_box = ctk.CTkTextbox(
+            self.main_frame,
+            wrap="word",
+            font=ctk.CTkFont(
+                size=14
+            )
+        )
+
+        self.chat_box.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=12,
+            pady=12
+        )
+
+        self.chat_box.configure(
+            state="disabled"
+        )
+
+        # ----------------------------------------------------
+        # INPUT AREA
+        # ----------------------------------------------------
+
+        self.input_frame = ctk.CTkFrame(
+            self.main_frame
+        )
+
+        self.input_frame.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=12,
+            pady=(0, 12)
+        )
+
+        self.input_frame.grid_columnconfigure(
+            0,
+            weight=1
+        )
+
+        self.query_entry = ctk.CTkEntry(
+            self.input_frame,
+            placeholder_text=(
+                "Ask a question about your documents..."
+            ),
+            height=44,
+            font=ctk.CTkFont(
+                size=14
+            )
+        )
+
+        self.query_entry.grid(
+            row=0,
+            column=0,
+            padx=(10, 6),
+            pady=10,
+            sticky="ew"
+        )
+
+        self.query_entry.bind(
+            "<Return>",
+            self.handle_enter
+        )
+
+        self.action_button = ctk.CTkButton(
+            self.input_frame,
+            text="Send",
+            width=100,
+            height=44,
+            command=self.handle_action
+        )
+
+        self.action_button.grid(
+            row=0,
+            column=1,
+            padx=(6, 10),
+            pady=10
+        )
+
+
+    # ========================================================
+    # STARTUP
+    # ========================================================
+
+    def startup_message(
+        self
+    ):
+
+        self.append_chat(
+            "SYSTEM",
+            (
+                "Offline Multimodal RAG AI Assistant is ready.\n\n"
+                "1. Select a folder containing documents.\n"
+                "2. Click Process Documents.\n"
+                "3. Ask questions about the indexed documents.\n\n"
+                "The assistant uses local retrieval and a "
+                "local Mistral model."
+            )
+        )
+
+
+    # ========================================================
+    # CHAT DISPLAY
+    # ========================================================
+
+    def append_chat(
+        self,
+        role,
+        text
+    ):
+
+        self.chat_box.configure(
+            state="normal"
+        )
+
+        if role == "USER":
+
+            prefix = "\n\nYou:\n"
+
+        elif role == "ASSISTANT":
+
+            prefix = "\n\nAssistant:\n"
+
+        else:
+
+            prefix = "\n\nSystem:\n"
+
+        self.chat_box.insert(
+            "end",
+            prefix + str(text)
+        )
+
+        self.chat_box.see(
+            "end"
+        )
+
+        self.chat_box.configure(
+            state="disabled"
+        )
+
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def set_status(
+        self,
+        text
+    ):
+
+        try:
+
+            self.after(
+                0,
+                lambda: self.status_label.configure(
+                    text=str(text)
+                )
+            )
+
+        except Exception:
+            pass
+
+
+    # ========================================================
+    # SELECT FOLDER
+    # ========================================================
+
+    def select_folder(
+        self
+    ):
+
+        folder = filedialog.askdirectory(
+            title="Select Document Folder"
+        )
+
+        if not folder:
+
+            return
+
+        self.selected_folder = folder
+
+        self.folder_label.configure(
+            text=folder
+        )
+
+        self.set_status(
+            "Folder selected. Ready to process."
+        )
+
+        self.append_chat(
+            "SYSTEM",
+            (
+                "Selected document folder:\n"
+                + folder
+            )
+        )
+
+        # ----------------------------------------------------
+        # Try cache
+        # ----------------------------------------------------
+
+        def cache_worker():
+
+            success = load_cached_memory(
+                folder,
+                lambda msg:
+                    self.set_status(msg)
+            )
+
+            if success:
+
+                self.after(
+                    0,
+                    lambda: self.append_chat(
+                        "SYSTEM",
+                        (
+                            "Cached document index loaded.\n"
+                            f"Indexed chunks: {len(chunks)}"
+                        )
+                    )
+                )
+
+                self.set_status(
+                    f"Ready â€¢ {len(chunks)} chunks loaded"
+                )
+
+            else:
+
+                self.set_status(
+                    "Folder selected. Ready to process."
+                )
+
+        threading.Thread(
+            target=cache_worker,
+            daemon=True
+        ).start()
+
+
+    # ========================================================
+    # PROCESS DOCUMENTS
+    # ========================================================
+
+    def start_processing(
+        self
+    ):
+
+        global is_processing
+
+        if is_processing:
+
+            return
+
+        if not self.selected_folder:
+
+            messagebox.showwarning(
+                "No Folder",
+                "Please select a document folder first."
+            )
+
+            return
+
+        processing_stop_event.clear()
+
+        is_processing = True
+
+        self.process_button.configure(
+            state="disabled",
+            text="Processing..."
+        )
+
+        self.select_button.configure(
+            state="disabled"
+        )
+
+        self.set_status(
+            "Starting document ingestion..."
+        )
+
+        threading.Thread(
+            target=self.processing_worker,
+            daemon=True
+        ).start()
+
+
+    def processing_worker(
+        self
+    ):
+
+        global is_processing
+
+        try:
+
+            def callback(
+                message
+            ):
+
+                self.set_status(
+                    message
+                )
+
+            success = run_ingestion(
+                self.selected_folder,
+                callback,
+                processing_stop_event
+            )
+
+            sync_core_rag_state()
+
+            if success:
+
+                count = len(
+                    chunks
+                )
+
+                vectors = (
+                    faiss_index.ntotal
+                    if faiss_index is not None
+                    else 0
+                )
+
+                self.after(
+                    0,
+                    lambda: self.append_chat(
+                        "SYSTEM",
+                        (
+                            "Document processing completed successfully.\n"
+                            f"Chunks: {count}\n"
+                            f"FAISS vectors: {vectors}"
+                        )
+                    )
+                )
+
+                self.set_status(
+                    f"Ready â€¢ {count} chunks indexed"
+                )
+
+            else:
+
+                self.set_status(
+                    "Document processing failed."
+                )
+
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Processing Error",
+                        (
+                            "Document ingestion failed.\n\n"
+                            "Check the terminal for details."
+                        )
+                    )
+                )
+
+        except Exception as e:
+
+            print(
+                "Processing worker error:",
+                e
+            )
+
+            self.set_status(
+                f"Processing error: {str(e)[:80]}"
+            )
+
+            self.after(
+                0,
+                lambda: messagebox.showerror(
+                    "Processing Error",
+                    str(e)
+                )
+            )
+
+        finally:
+
+            is_processing = False
+
+            self.after(
+                0,
+                lambda: self.process_button.configure(
+                    state="normal",
+                    text="Process Documents"
+                )
+            )
+
+            self.after(
+                0,
+                lambda: self.select_button.configure(
+                    state="normal"
+                )
+            )
+
+
+    # ========================================================
+    # ENTER / SEND
+    # ========================================================
+
+    def handle_enter(
+        self,
+        event=None
+    ):
+
+        self.handle_action()
+
+        return "break"
+
+
+    def handle_action(
+        self
+    ):
+
+        if is_generating:
+
+            self.stop_generation()
+
+            return
+
+        self.start_generation()
+
+
+    # ========================================================
+    # STOP GENERATION
+    # ========================================================
+
+    def stop_generation(
+        self
+    ):
+
+        global is_generating
+
+        generation_stop_event.set()
+
+        self.set_status(
+            "Stopping generation..."
+        )
+
+        self.action_button.configure(
+            state="disabled",
+            text="Stopping..."
+        )
+
+
+    # ========================================================
+    # START GENERATION
+    # ========================================================
+
+    def start_generation(
+        self
+    ):
+
+        global is_generating
+        global is_busy
+        global last_response_text
+
+        if is_generating:
+
+            return
+
+        query = (
+            self.query_entry
+            .get()
+            .strip()
+        )
+
+        if not query:
+
+            return
+
+        if is_processing:
+
+            messagebox.showwarning(
+                "Processing",
+                (
+                    "Please wait until document processing "
+                    "finishes."
+                )
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Greetings do not require documents
+        # ----------------------------------------------------
+
+        greetings = {
+            "hi",
+            "hello",
+            "hey",
+            "hii",
+            "hlo",
+            "hello ai"
+        }
+
+        if query.lower() in greetings:
+
+            self.query_entry.delete(
+                0,
+                "end"
+            )
+
+            self.append_chat(
+                "USER",
+                query
+            )
+
+            answer = (
+                "Hello! I am your offline local AI assistant. "
+                "Select and process documents to ask questions "
+                "about your files."
+            )
+
+            self.append_chat(
+                "ASSISTANT",
+                answer
+            )
+
+            last_response_text = answer
+
+            return
+
+        # ----------------------------------------------------
+        # Require indexed documents
+        # ----------------------------------------------------
+
+        sync_core_rag_state()
+
+        if not chunks:
+
+            messagebox.showwarning(
+                "No Documents",
+                (
+                    "No documents are currently indexed.\n\n"
+                    "Select a document folder and click "
+                    "'Process Documents' first."
+                )
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Start request
+        # ----------------------------------------------------
+
+        is_generating = True
+
+        is_busy = True
+
+        generation_stop_event.clear()
+
+        self.query_entry.delete(
+            0,
+            "end"
+        )
+
+        self.query_entry.configure(
+            state="disabled"
+        )
+
+        self.action_button.configure(
+            text="Stop",
+            state="normal"
+        )
+
+        self.append_chat(
+            "USER",
+            query
+        )
+
+        self.set_status(
+            "Retrieving relevant documents..."
+        )
+
+        threading.Thread(
+            target=self.generation_worker,
+            args=(query,),
+            daemon=True
+        ).start()
+
+
+    # ========================================================
+    # GENERATION WORKER
+    # ========================================================
+
+    def generation_worker(
+        self,
+        query
+    ):
+
+        global is_generating
+        global is_busy
+        global last_response_text
+
+        try:
+
+            # ------------------------------------------------
+            # Make sure retrieval sees current core state
+            # ------------------------------------------------
+
+            sync_core_rag_state()
+
+            # ------------------------------------------------
+            # RETRIEVAL
+            # ------------------------------------------------
+
+            selected, context = retrieve_context(
+                query
+            )
+
+            if generation_stop_event.is_set():
+
+                return
+
+            if not selected or not context:
+
+                answer = (
+                    "I could not find this information "
+                    "in the provided documents."
+                )
+
+                last_response_text = answer
+
+                self.after(
+                    0,
+                    lambda: self.append_chat(
+                        "ASSISTANT",
+                        answer
+                    )
+                )
+
+                self.set_status(
+                    "No sufficiently relevant document found."
+                )
+
+                return
+
+            sources = get_retrieved_sources(
+                selected
+            )
+
+            self.set_status(
+                f"Retrieved {len(selected)} relevant chunk(s)"
+            )
+
+            # ------------------------------------------------
+            # GROUNDED PROMPT
+            # ------------------------------------------------
+
+            prompt = f"""
+[INST]
+You are an offline document question-answering assistant.
+
+Answer the user's question using ONLY the provided local
+document context.
+
+STRICT RULES:
+
+1. Do not use outside or pretrained knowledge.
+2. Do not invent facts.
+3. Do not guess.
+4. If the answer is not supported by the context, say exactly:
+   I could not find this information in the provided documents.
+5. Give a direct and concise answer.
+6. When useful, mention the source filename.
+7. Do not create a different question.
+8. Do not continue with unrelated information.
+
+LOCAL DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION:
+{query}
+
+ANSWER:
+[/INST]
+""".strip()
+
+            # ------------------------------------------------
+            # GENERATION
+            # ------------------------------------------------
+
+            self.set_status(
+                "Generating answer with local Mistral..."
+            )
+
+            answer = generate_answer(
+                prompt,
+                "",
+                max_tokens=MAX_OUTPUT_TOKENS,
+                temperature=0.15,
+                top_p=0.9,
+                repeat_penalty=1.1
+            )
+
+            if generation_stop_event.is_set():
+
+                return
+
+            if not answer:
+
+                answer = (
+                    "I could not generate an answer from "
+                    "the provided documents."
+                )
+
+            last_response_text = answer
+
+            # ------------------------------------------------
+            # Add source information only when appropriate.
+            # ------------------------------------------------
+
+            if sources:
+
+                source_text = ", ".join(
+                    sources
+                )
+
+                # Avoid duplicating source if model already
+                # included it.
+
+                if (
+                    source_text.lower()
+                    not in answer.lower()
+                ):
+
+                    answer = (
+                        answer.rstrip()
+                        + f"\n\nSource: {source_text}"
+                    )
+
+            self.after(
+                0,
+                lambda: self.append_chat(
+                    "ASSISTANT",
+                    answer
+                )
+            )
+
+            self.set_status(
+                "Ready"
+            )
+
+        except Exception as e:
+
+            print(
+                "Generation error:",
+                e
+            )
+
+            error_text = (
+                f"Generation error: {e}"
+            )
+
+            self.after(
+                0,
+                lambda: self.append_chat(
+                    "SYSTEM",
+                    error_text
+                )
+            )
+
+            self.set_status(
+                "Generation failed."
+
+            )
+
+        finally:
+
+            is_generating = False
+
+            is_busy = False
+
+            generation_stop_event.clear()
+
+            self.after(
+                0,
+                self.finish_generation
+            )
+
+
+    # ========================================================
+    # FINISH GENERATION
+    # ========================================================
+
+    def finish_generation(
+        self
+    ):
+
+        self.query_entry.configure(
+            state="normal"
+        )
+
+        self.action_button.configure(
+            state="normal",
+            text="Send"
+        )
+
+        self.query_entry.focus_set()
+
+        if not is_processing:
+
+            self.set_status(
+                "Ready"
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+    print(
+        "        OFFLINE MULTIMODAL RAG AI ASSISTANT"
+    )
+    print("=" * 70)
+
+    print(
+        "Runtime: OFFLINE"
+    )
+
+    print(
+        "RAG: FAISS"
+    )
+
+    print(
+        "Embedding: all-MiniLM-L6-v2"
+    )
+
+    print(
+        "LLM: Local Mistral 7B"
+    )
+
+    print(
+        "Model:",
+        MODEL_PATH
+    )
+
+    print(
+        "GPU layers:",
+        GPU_LAYERS
+    )
+
+    print(
+        "Context:",
+        CONTEXT_SIZE
+    )
+
+    print(
+        "CPU threads:",
+        CPU_THREADS
+    )
+
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Start GUI
+    # --------------------------------------------------------
+
+    app = RAGApp()
+
+    app.mainloop()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()

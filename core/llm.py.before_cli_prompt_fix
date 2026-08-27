@@ -1,0 +1,158 @@
+import os
+import subprocess
+import re
+
+
+MODEL_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "models",
+        "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+    )
+)
+
+LLAMA_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "llama_cpp_local",
+        "llama-cli.exe"
+    )
+)
+
+
+SYSTEM_PROMPT = (
+    "You are an offline document question-answering assistant. "
+    "Answer ONLY using the provided context. "
+    "If the answer is not present in the context, say exactly: "
+    "\"I couldn't find this information in the provided documents.\" "
+    "Do not use outside knowledge."
+)
+
+
+def generate_answer(question, context=""):
+    """
+    Generate one non-interactive answer using the local Mistral model.
+
+    Supports both:
+      1. generate_answer(question, context)
+      2. generate_answer(full_prompt, "")
+    """
+
+    # If answer_engine already built the complete RAG prompt,
+    # do not wrap it inside another prompt.
+    if context:
+        prompt = (
+            "You are an offline document question-answering assistant.\\n"
+            "Answer ONLY using the provided context.\\n"
+            "Do not use outside knowledge.\\n"
+            "Do not invent facts.\\n"
+            "Give one concise direct answer.\\n"
+            "If the answer is not in the context, say exactly:\\n"
+            "I couldn't find this information in the provided documents.\\n\\n"
+            "Context:\\n"
+            + str(context)
+            + "\\n\\n"
+            "Question:\\n"
+            + str(question)
+            + "\\n\\n"
+            "Answer:"
+        )
+    else:
+        prompt = str(question)
+
+    command = [
+        LLAMA_PATH,
+        "-m", MODEL_PATH,
+        "-ngl", "99",
+        "-p", prompt,
+        "-n", "128",
+        "--temp", "0.2",
+        "--no-display-prompt",
+        "--single-turn"
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=180
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip() or
+            "Mistral inference failed."
+        )
+
+    output = result.stdout.strip()
+
+    # Remove CLI metadata / prompt echoes.
+    if "[ Prompt:" in output:
+        output = output.split("[ Prompt:", 1)[0].strip()
+
+    if "Exiting..." in output:
+        output = output.split("Exiting...", 1)[0].strip()
+
+    # Remove accidental continuation.
+    lines = []
+
+    for line in output.splitlines():
+        stripped = line.strip()
+
+        if stripped.lower().startswith("question:"):
+            break
+
+        if stripped.lower().startswith("user question:"):
+            break
+
+        lines.append(line)
+
+    output = "\\n".join(lines).strip()
+
+    # Remove a leading answer label.
+    if output.lower().startswith("answer:"):
+        output = output[7:].strip()
+
+    return output.strip()
+
+def answer_from_retrieval(question, results):
+
+    if not results:
+        return (
+            "I couldn't find this information in the "
+            "provided documents."
+        )
+
+    context_parts = []
+
+    for result in results:
+
+        source = result.get(
+            "source",
+            "Unknown"
+        )
+
+        text = result.get(
+            "text",
+            ""
+        )
+
+        if not text:
+            continue
+
+        context_parts.append(
+            f"[Source: {source}]\n{text}"
+        )
+
+    context = "\n\n".join(
+        context_parts
+    )
+
+    return generate_answer(
+        question,
+        context
+    )

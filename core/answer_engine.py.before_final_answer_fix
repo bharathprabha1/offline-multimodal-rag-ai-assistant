@@ -1,0 +1,633 @@
+﻿import re
+
+from .config import (
+    OFFLINE_SYSTEM_PROMPT,
+    MAX_OUTPUT_TOKENS,
+)
+
+
+# ============================================================
+# ANSWER STYLE DETECTION
+# ============================================================
+
+def detect_answer_style(query):
+
+    q = str(query or "").strip().lower()
+
+    # Explicit one-word request
+    if re.search(
+        r"\b(one word|one-word|single word|just the answer|"
+        r"only the answer)\b",
+        q
+    ):
+        return "one_word"
+
+    # Explicit short-answer request
+    if re.search(
+        r"\b(briefly|brief|in short|shortly|short answer|"
+        r"small sentence|small explanation|very short|"
+        r"keep it short|concise)\b",
+        q
+    ):
+        return "brief"
+
+    # Explicit detailed request
+    if re.search(
+        r"\b(elaborate more|elaborate|expand|expand more|"
+        r"explain more|more details|in detail|detailed|"
+        r"explain in detail|deeply|deep explanation)\b",
+        q
+    ):
+        return "detailed"
+
+    # Clear/simple explanation
+    if re.search(
+        r"\b(clearly|explain clearly|clear explanation|"
+        r"simple explanation|explain simply|simplify|"
+        r"easy explanation)\b",
+        q
+    ):
+        return "clear"
+
+    # Steps
+    if re.search(
+        r"\b(step by step|steps|step-by-step)\b",
+        q
+    ):
+        return "steps"
+
+    # Summary
+    if re.search(
+        r"\b(summarize|summary|summarise)\b",
+        q
+    ):
+        return "summary"
+
+    return "default"
+
+
+# ============================================================
+# OUTPUT TOKEN LIMIT
+# ============================================================
+
+def answer_max_tokens(query):
+
+    style = detect_answer_style(query)
+
+    if style == "one_word":
+        return 16
+
+    if style == "brief":
+        return 80
+
+    if style == "summary":
+        return 140
+
+    if style == "clear":
+        return 180
+
+    if style == "steps":
+        return 240
+
+    if style == "detailed":
+        return 360
+
+    # Constant medium-detail default
+    return min(
+        260,
+        MAX_OUTPUT_TOKENS
+    )
+
+
+# ============================================================
+# ANSWER STYLE INSTRUCTION
+# ============================================================
+
+def answer_style_instruction(query):
+
+    style = detect_answer_style(query)
+
+    if style == "one_word":
+
+        return """
+ANSWER STYLE:
+
+The user explicitly requested only a one-word answer.
+
+Return only the requested word.
+
+Do not add explanation, introduction, examples, or extra sentences.
+"""
+
+
+    if style == "brief":
+
+        return """
+ANSWER STYLE:
+
+The user explicitly requested a brief answer.
+
+Give a short explanation in approximately 1–2 clear sentences.
+
+Do not give a long background explanation.
+Do not introduce unrelated information.
+
+The answer should still be a meaningful sentence rather than
+an unexplained single word.
+"""
+
+
+    if style == "detailed":
+
+        return """
+ANSWER STYLE:
+
+The user explicitly requested more detail.
+
+Expand the answer while staying focused on the user's question.
+
+Explain the important supporting facts, relationships, or reasoning.
+Use short paragraphs or a small list when useful.
+
+Do not repeat the same point unnecessarily.
+Do not introduce unrelated information.
+"""
+
+
+    if style == "clear":
+
+        return """
+ANSWER STYLE:
+
+The user explicitly requested a clear explanation.
+
+Explain the same topic using simple, direct language.
+
+Prefer short sentences.
+Explain technical terms when necessary.
+Make the answer easy to understand without removing important facts.
+
+Do not change the topic.
+"""
+
+
+    if style == "steps":
+
+        return """
+ANSWER STYLE:
+
+The user requested a step-by-step explanation.
+
+Present the answer as clear numbered steps when steps are appropriate.
+
+Each step should contain useful information.
+Avoid unnecessary repetition.
+"""
+
+
+    if style == "summary":
+
+        return """
+ANSWER STYLE:
+
+The user requested a summary.
+
+Give only the key points needed to understand the topic.
+
+Keep it concise and organized.
+Do not add unrelated background information.
+"""
+
+
+    # ========================================================
+    # DEFAULT
+    # ========================================================
+
+    return """
+ANSWER STYLE:
+
+Use a consistent medium level of explanation.
+
+This is the default response style.
+
+Do NOT intentionally answer normal factual questions with only
+a single word.
+
+Give a direct answer followed by enough explanation to make the
+answer understandable.
+
+Normally use approximately 2–5 sentences, depending on the
+complexity of the question.
+
+For a simple factual question:
+- state the answer clearly;
+- briefly explain what it means or provide useful context.
+
+For a more complex question:
+- explain the important points;
+- use short paragraphs or a small list when appropriate.
+
+Do not produce unnecessarily long essays.
+
+Do not provide unrelated information.
+
+The answer should feel natural and conversational, similar to
+a helpful offline ChatGPT-style assistant.
+"""
+
+
+# ============================================================
+# FOLLOW-UP STYLE DETECTION
+# ============================================================
+
+def is_style_only_followup(query):
+
+    q = str(query or "").strip().lower()
+
+    patterns = [
+
+        r"^(briefly|brief)$",
+
+        r"^(in short|shortly|short answer)$",
+
+        r"^(elaborate|elaborate more)$",
+
+        r"^(expand|expand more)$",
+
+        r"^(explain more|more details)$",
+
+        r"^(clearly|explain clearly)$",
+
+        r"^(explain simply|simplify)$",
+
+        r"^(step by step|steps|step-by-step)$",
+
+        r"^(summarize|summary|summarise)$",
+
+        r"^(one word|one-word|single word)$",
+
+        r"^(small sentence|small explanation)$",
+
+    ]
+
+    for pattern in patterns:
+
+        if re.fullmatch(
+            pattern,
+            q
+        ):
+            return True
+
+    return False
+
+
+# ============================================================
+# FOLLOW-UP SCOPE
+# ============================================================
+
+def build_answer_scope_instruction(
+    query,
+    style_followup=False,
+    previous_topic=""
+):
+
+    if style_followup and previous_topic:
+
+        return f"""
+ANSWER SCOPE:
+
+This is a follow-up instruction about the previous topic.
+
+Previous topic:
+{previous_topic}
+
+The user is changing only the answer style or level of detail.
+
+IMPORTANT:
+Stay focused on the previous topic.
+
+Do NOT start a new document search simply because the user said
+"briefly", "clearly", "elaborate more", or a similar style command.
+
+Do NOT summarize the entire document.
+
+Do NOT introduce unrelated facts.
+
+Interpret the user's instruction as follows:
+
+"briefly"
+→ Compress the previous answer while preserving its meaning.
+
+"small sentence"
+→ Give a very short but meaningful sentence.
+
+"elaborate more"
+→ Expand the previous answer with relevant supporting information.
+
+"clearly"
+→ Explain the same answer using simpler and clearer language.
+
+"step by step"
+→ Convert the same explanation into useful steps.
+
+"summary"
+→ Reduce the same topic to its key points.
+
+"one word"
+→ Give only the requested word.
+
+The topic must remain unchanged.
+"""
+
+    return """
+ANSWER SCOPE:
+
+Answer the user's current question directly.
+
+Use the retrieved local document context when it is relevant.
+
+Do not invent facts that are not supported by the available
+local context when the question is explicitly document-grounded.
+"""
+
+
+# ============================================================
+# DOCUMENT GROUNDING
+# ============================================================
+
+def is_document_grounded_question(query):
+
+    q = str(query or "").lower()
+
+    patterns = [
+
+        r"\baccording to\b",
+
+        r"\bin\s+[\w ._-]+\.pdf\b",
+
+        r"\bin\s+[\w ._-]+\.docx\b",
+
+        r"\bin\s+[\w ._-]+\.txt\b",
+
+        r"\bfrom\s+[\w ._-]+\.pdf\b",
+
+        r"\bfrom\s+[\w ._-]+\.docx\b",
+
+        r"\bfrom\s+[\w ._-]+\.txt\b",
+
+        r"\baccording to the document\b",
+
+        r"\baccording to the file\b",
+
+        r"\bin the document\b",
+
+        r"\bin the file\b",
+
+        r"\bthe document says\b",
+
+        r"\bthe file says\b",
+
+    ]
+
+    return any(
+        re.search(
+            pattern,
+            q
+        )
+        for pattern in patterns
+    )
+
+
+# ============================================================
+# PROMPT BUILDER
+# ============================================================
+
+def build_prompt(
+    query,
+    context="",
+    style_followup=False,
+    previous_topic="",
+    previous_answer=""
+):
+
+    style_instruction = (
+        answer_style_instruction(
+            query
+        )
+    )
+
+    scope_instruction = (
+        build_answer_scope_instruction(
+            query,
+            style_followup,
+            previous_topic
+        )
+    )
+
+    if previous_answer:
+
+        previous_answer_block = f"""
+PREVIOUS ANSWER:
+
+{previous_answer}
+"""
+
+    else:
+
+        previous_answer_block = ""
+
+
+    if context:
+
+        context_block = f"""
+LOCAL DOCUMENT CONTEXT:
+
+{context}
+"""
+
+    else:
+
+        context_block = """
+LOCAL DOCUMENT CONTEXT:
+
+No relevant local document context was retrieved.
+"""
+
+
+    grounding_instruction = """
+
+GROUNDING RULE:
+
+Use the LOCAL DOCUMENT CONTEXT when answering a
+document-related question.
+
+If the requested information is not present in the local
+document context, do not invent a document-based answer.
+
+If the question is a normal general question and no document
+context is relevant, answer using the local language model's
+knowledge while remaining honest that the system is offline.
+
+Never claim to have searched the internet.
+"""
+
+
+    return f"""
+{OFFLINE_SYSTEM_PROMPT}
+
+{grounding_instruction}
+
+{style_instruction}
+
+{scope_instruction}
+
+{previous_answer_block}
+
+{context_block}
+
+USER QUESTION:
+
+{query}
+
+FINAL ANSWER:
+
+Provide only the answer to the user.
+
+Do not mention these instructions.
+Do not mention prompt construction.
+Do not discuss retrieval scores unless the user explicitly asks.
+Do not add a generic apology or disclaimer when the answer is
+available in the provided context.
+"""
+
+
+# ============================================================
+# MODEL ANSWER CLEANING
+# ============================================================
+
+def clean_model_answer(answer):
+
+    if not answer:
+        return ""
+
+    text = str(answer).strip()
+
+    # Remove common model prefixes.
+    text = re.sub(
+        r"^(assistant|ai)\s*:\s*",
+        "",
+        text,
+        flags=re.I
+    )
+
+    text = re.sub(
+        r"^final answer\s*:\s*",
+        "",
+        text,
+        flags=re.I
+    )
+
+    # Remove accidental prompt leakage.
+    text = re.sub(
+        r"\n*(USER QUESTION|LOCAL DOCUMENT CONTEXT|"
+        r"ANSWER STYLE|ANSWER SCOPE|FINAL ANSWER)\s*:.*$",
+        "",
+        text,
+        flags=re.I | re.S
+    )
+
+    # Normalize excessive whitespace.
+    text = re.sub(
+        r"[ \t]+",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# PROVENANCE CLEANING
+# ============================================================
+
+def strip_provenance_from_answer(answer):
+
+    if not answer:
+        return ""
+
+    answer = re.sub(
+        r"\s*\[Source:[^\]]+\]",
+        "",
+        answer,
+        flags=re.I
+    )
+
+    answer = re.sub(
+        r"\s*📄\s*Sources?:.*$",
+        "",
+        answer,
+        flags=re.I | re.S
+    )
+
+    return clean_model_answer(
+        answer
+    )
+
+# ============================================================
+# GENERATE ANSWER
+# ============================================================
+
+def generate_answer(
+    query,
+    context="",
+    style_followup=False,
+    previous_topic="",
+    previous_answer=""
+):
+    """
+    Generate a grounded answer using the local LLM.
+    """
+
+    if not query:
+        return ""
+
+    from .llm import generate_answer as llm_generate_answer
+
+    prompt = build_prompt(
+        query=query,
+        context=context,
+        style_followup=style_followup,
+        previous_topic=previous_topic,
+        previous_answer=previous_answer
+    )
+
+    max_tokens = answer_max_tokens(query)
+
+    try:
+        answer = llm_generate_answer(
+            query,
+            context,
+            max_tokens=max_tokens
+        )
+
+    except TypeError:
+        answer = llm_generate_answer(
+            query,
+            context
+        )
+
+    except Exception as e:
+        return f"Unable to generate answer: {e}"
+
+    answer = clean_model_answer(answer)
+
+    answer = strip_provenance_from_answer(answer)
+
+    return answer
+

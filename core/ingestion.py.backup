@@ -1,0 +1,501 @@
+﻿import os
+import json
+import numpy as np
+import faiss
+
+from .config import (
+    RAG_MAX_CONTEXT_CHUNKS,
+    RAG_MAX_CHUNK_CHARS,
+    RAG_MAX_CONTEXT_CHARS,
+    TOP_K,
+    SIMILARITY_THRESHOLD,
+)
+
+# These functions/globals will be supplied by rag.py
+# during the transition to the modular architecture.
+
+
+def build_faiss_index(vectors):
+    """
+    Build a FAISS inner-product index from embedding vectors.
+
+    Vectors are L2-normalized first, so inner-product scores are
+    equivalent to cosine similarity.
+    """
+
+    if vectors is None:
+        return None
+
+    matrix = np.asarray(
+        vectors,
+        dtype=np.float32
+    )
+
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        return None
+
+    faiss.normalize_L2(matrix)
+
+    dimension = int(matrix.shape[1])
+
+    index = faiss.IndexFlatIP(
+        dimension
+    )
+
+    index.add(matrix)
+
+    return index
+
+
+def load_cached_memory(
+    target_folder,
+    status_callback=None,
+    state=None
+):
+    """
+    Load previously generated chunks, embeddings and FAISS index.
+
+    state must contain:
+        chunks
+        embeddings
+        faiss_index
+    """
+
+    if state is None:
+        raise ValueError(
+            "load_cached_memory requires a state dictionary."
+        )
+
+    cache_dir = os.path.join(
+        target_folder,
+        "cache"
+    )
+
+    chunks_file = os.path.join(
+        cache_dir,
+        "chunks.json"
+    )
+
+    embeddings_file = os.path.join(
+        cache_dir,
+        "embeddings.npy"
+    )
+
+    faiss_file = os.path.join(
+        cache_dir,
+        "faiss.index"
+    )
+
+    if not (
+        os.path.exists(chunks_file)
+        and os.path.exists(embeddings_file)
+    ):
+        return False
+
+    try:
+
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            cached_chunks = json.load(f)
+
+        cached_embeddings = np.load(
+            embeddings_file
+        )
+
+        if not cached_chunks:
+            return False
+
+        if (
+            cached_embeddings.ndim != 2
+            or len(cached_chunks) != len(cached_embeddings)
+        ):
+
+            print(
+                "Cache size mismatch."
+            )
+
+            return False
+
+        state["chunks"] = cached_chunks
+
+        state["embeddings"] = np.asarray(
+            cached_embeddings,
+            dtype=np.float32
+        )
+
+        loaded_index = None
+
+        if os.path.exists(faiss_file):
+
+            try:
+
+                loaded_index = faiss.read_index(
+                    faiss_file
+                )
+
+                if (
+                    loaded_index.ntotal
+                    != len(state["chunks"])
+                    or loaded_index.d
+                    != state["embeddings"].shape[1]
+                ):
+
+                    print(
+                        "FAISS cache mismatch. Rebuilding index."
+                    )
+
+                    loaded_index = None
+
+            except Exception as e:
+
+                print(
+                    "FAISS cache load error:",
+                    e
+                )
+
+                loaded_index = None
+
+        if loaded_index is None:
+
+            loaded_index = build_faiss_index(
+                state["embeddings"]
+            )
+
+            if loaded_index is None:
+                return False
+
+            try:
+
+                faiss.write_index(
+                    loaded_index,
+                    faiss_file
+                )
+
+            except Exception as e:
+
+                print(
+                    "FAISS cache save warning:",
+                    e
+                )
+
+        state["faiss_index"] = loaded_index
+
+        # Keep the in-memory NumPy copy normalized as well.
+        faiss.normalize_L2(
+            state["embeddings"]
+        )
+
+        if status_callback:
+
+            status_callback(
+                f"Loaded FAISS memory: "
+                f"{len(state['chunks'])} segments."
+            )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "Cache load error:",
+            e
+        )
+
+        state["faiss_index"] = None
+
+        return False
+
+
+def run_ingestion(
+    target_folder,
+    status_callback,
+    stop_event=None,
+    state=None,
+    load_embedder=None,
+    extract_pdf=None,
+    extract_docx=None,
+    extract_txt=None,
+    process_audio=None,
+    create_chunks=None,
+    embedder=None
+):
+    """
+    Ingest local documents, create embeddings and build FAISS index.
+
+    This keeps the original ingestion behavior while removing
+    direct dependence on rag.py global variables.
+    """
+
+    if state is None:
+        raise ValueError(
+            "run_ingestion requires a state dictionary."
+        )
+
+    if load_embedder is None:
+        raise ValueError(
+            "run_ingestion requires load_embedder."
+        )
+
+    if extract_pdf is None:
+        raise ValueError(
+            "run_ingestion requires extract_pdf."
+        )
+
+    if extract_docx is None:
+        raise ValueError(
+            "run_ingestion requires extract_docx."
+        )
+
+    if extract_txt is None:
+        raise ValueError(
+            "run_ingestion requires extract_txt."
+        )
+
+    if process_audio is None:
+        raise ValueError(
+            "run_ingestion requires process_audio."
+        )
+
+    if create_chunks is None:
+        raise ValueError(
+            "run_ingestion requires create_chunks."
+        )
+
+    if not load_embedder(
+        status_callback
+    ):
+        return False
+
+    status_callback(
+        f"Scanning folder: "
+        f"{os.path.basename(target_folder)}"
+    )
+
+    try:
+
+        files = os.listdir(
+            target_folder
+        )
+
+    except Exception as e:
+
+        status_callback(
+            f"Folder access error: {e}"
+        )
+
+        return False
+
+    if not files:
+
+        status_callback(
+            "Folder is empty."
+        )
+
+        return False
+
+    all_chunks = []
+
+    for index, filename in enumerate(
+        files,
+        start=1
+    ):
+
+        if (
+            stop_event is not None
+            and stop_event.is_set()
+        ):
+
+            status_callback(
+                "Document processing stopped."
+            )
+
+            return False
+
+        path = os.path.join(
+            target_folder,
+            filename
+        )
+
+        if not os.path.isfile(path):
+            continue
+
+        status_callback(
+            f"[{index}/{len(files)}] "
+            f"Reading: {filename}"
+        )
+
+        text = ""
+
+        extension = (
+            os.path.splitext(filename)[1]
+            .lower()
+        )
+
+        try:
+
+            if extension == ".pdf":
+
+                text = extract_pdf(path)
+
+            elif extension == ".docx":
+
+                text = extract_docx(path)
+
+            elif extension == ".txt":
+
+                text = extract_txt(path)
+
+            elif extension == ".wav":
+
+                text = process_audio(path)
+
+            else:
+
+                continue
+
+        except Exception as e:
+
+            print(
+                f"Error processing "
+                f"{filename}:",
+                e
+            )
+
+            continue
+
+        if not text:
+            continue
+
+        file_chunks = create_chunks(
+            text,
+            filename
+        )
+
+        all_chunks.extend(
+            file_chunks
+        )
+
+    if not all_chunks:
+
+        status_callback(
+            "No readable documents found."
+        )
+
+        return False
+
+    if (
+        stop_event is not None
+        and stop_event.is_set()
+    ):
+
+        status_callback(
+            "Document processing stopped "
+            "before embedding."
+        )
+
+        return False
+
+    status_callback(
+        f"Creating embeddings for "
+        f"{len(all_chunks)} segments..."
+    )
+
+    try:
+
+        corpus = [
+            item["text"]
+            for item in all_chunks
+        ]
+
+        vectors = embedder.encode(
+            corpus,
+            show_progress_bar=False,
+            convert_to_numpy=True
+        )
+
+        vectors = np.asarray(
+            vectors,
+            dtype=np.float32
+        )
+
+        # Normalize vectors so FAISS inner product
+        # is equivalent to cosine similarity.
+        faiss.normalize_L2(
+            vectors
+        )
+
+        new_faiss_index = faiss.IndexFlatIP(
+            int(vectors.shape[1])
+        )
+
+        new_faiss_index.add(
+            vectors
+        )
+
+        state["chunks"] = all_chunks
+
+        state["embeddings"] = vectors
+
+        state["faiss_index"] = (
+            new_faiss_index
+        )
+
+        cache_dir = os.path.join(
+            target_folder,
+            "cache"
+        )
+
+        os.makedirs(
+            cache_dir,
+            exist_ok=True
+        )
+
+        with open(
+            os.path.join(
+                cache_dir,
+                "chunks.json"
+            ),
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            json.dump(
+                all_chunks,
+                f,
+                ensure_ascii=False
+            )
+
+        np.save(
+            os.path.join(
+                cache_dir,
+                "embeddings.npy"
+            ),
+            vectors
+        )
+
+        faiss.write_index(
+            state["faiss_index"],
+            os.path.join(
+                cache_dir,
+                "faiss.index"
+            )
+        )
+
+        status_callback(
+            f"Success! Learned "
+            f"{len(all_chunks)} segments."
+        )
+
+        return True
+
+    except Exception as e:
+
+        status_callback(
+            f"Embedding error: {e}"
+        )
+
+        return False

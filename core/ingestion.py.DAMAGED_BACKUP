@@ -1,0 +1,866 @@
+﻿import os
+import re
+import threading
+import time
+
+from .config import (
+    MODEL_PATH,
+    GPU_LAYERS,
+    CONTEXT_SIZE,
+    CPU_THREADS,
+    MAX_OUTPUT_TOKENS,
+    RAG_MAX_CONTEXT_CHUNKS,
+    RAG_MAX_CHUNK_CHARS,
+    RAG_MAX_CONTEXT_CHARS,
+    RAG_MIN_GENERATION_TOKENS,
+    RAG_CONTEXT_RESERVE_TOKENS,
+)
+
+
+# ============================================================
+# GLOBAL LLM STATE
+# ============================================================
+
+llm = None
+gpu_available = False
+
+llm_load_lock = threading.Lock()
+
+
+# ============================================================
+# CALLBACK HELPER
+# ============================================================
+
+def _callback(callback, message):
+    if callback:
+        try:
+            callback(str(message))
+        except Exception:
+            pass
+
+
+# ============================================================
+# GPU DETECTION
+# ============================================================
+
+def detect_gpu_support():
+
+    global gpu_available
+
+    try:
+
+        from llama_cpp import llama_supports_gpu_offload
+
+        gpu_available = bool(
+            llama_supports_gpu_offload()
+        )
+
+        return gpu_available
+
+    except Exception as e:
+
+        print(
+            "GPU detection error:",
+            e
+        )
+
+        gpu_available = False
+
+        return False
+
+
+# ============================================================
+# LOAD LOCAL MISTRAL
+# ============================================================
+
+def load_llm(
+    callback=None,
+    force_reload=False
+):
+
+    global llm
+    global gpu_available
+
+    # --------------------------------------------------------
+    # MODEL CHECK
+    # --------------------------------------------------------
+
+    if not os.path.isfile(MODEL_PATH):
+
+        _callback(
+            callback,
+            f"ERROR: Mistral model not found:\n{MODEL_PATH}"
+        )
+
+        return False
+
+    # --------------------------------------------------------
+    # ALREADY LOADED
+    # --------------------------------------------------------
+
+    if llm is not None and not force_reload:
+        return True
+
+    # --------------------------------------------------------
+    # THREAD SAFE LOADING
+    # --------------------------------------------------------
+
+    with llm_load_lock:
+
+        if llm is not None and not force_reload:
+            return True
+
+        try:
+
+            from llama_cpp import Llama
+
+        except Exception as e:
+
+            _callback(
+                callback,
+                f"llama_cpp import failed: {e}"
+            )
+
+            return False
+
+        try:
+
+            if force_reload:
+                llm = None
+
+            _callback(
+                callback,
+                "Checking local LLM backend..."
+            )
+
+            gpu_available = detect_gpu_support()
+
+            start_time = time.perf_counter()
+
+            # ====================================================
+            # GPU MODE
+            # ====================================================
+
+            if gpu_available:
+
+                _callback(
+                    callback,
+                    "CUDA detected."
+                )
+
+                _callback(
+                    callback,
+                    f"Loading Mistral 7B with "
+                    f"{GPU_LAYERS} GPU layers..."
+                )
+
+                try:
+
+                    llm = Llama(
+                        model_path=MODEL_PATH,
+                        n_ctx=CONTEXT_SIZE,
+                        n_threads=CPU_THREADS,
+                        n_gpu_layers=GPU_LAYERS,
+                        verbose=False
+                    )
+
+                    elapsed = (
+                        time.perf_counter()
+                        - start_time
+                    )
+
+                    _callback(
+                        callback,
+                        f"Mistral ready: GPU mode "
+                        f"({elapsed:.1f}s)"
+                    )
+
+                    return True
+
+                except Exception as gpu_error:
+
+                    print(
+                        "GPU LLM load failed:",
+                        gpu_error
+                    )
+
+                    _callback(
+                        callback,
+                        "GPU loading failed."
+                    )
+
+                    _callback(
+                        callback,
+                        "Falling back to CPU mode..."
+                    )
+
+                    llm = None
+
+            # ====================================================
+            # CPU FALLBACK
+            # ====================================================
+
+            llm = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=CONTEXT_SIZE,
+                n_threads=CPU_THREADS,
+                n_gpu_layers=0,
+                verbose=False
+            )
+
+            elapsed = (
+                time.perf_counter()
+                - start_time
+            )
+
+            _callback(
+                callback,
+                f"Mistral ready: CPU mode "
+                f"({elapsed:.1f}s)"
+            )
+
+            gpu_available = False
+
+            return True
+
+        except Exception as e:
+
+            llm = None
+
+            _callback(
+                callback,
+                f"LLM load error: {e}"
+            )
+
+            return False
+
+
+# ============================================================
+# NORMALIZE CHUNK
+# ============================================================
+
+def _get_chunk_text(item):
+
+    if isinstance(item, dict):
+
+        return str(
+            item.get(
+                "text",
+                ""
+            )
+        ).strip()
+
+    return str(item).strip()
+
+
+def _get_chunk_source(item):
+
+    if isinstance(item, dict):
+
+        source = item.get(
+            "source",
+            "Unknown source"
+        )
+
+        return str(source).strip()
+
+    return "Unknown source"
+
+
+# ============================================================
+# BUILD RAG CONTEXT
+# ============================================================
+
+def build_context(
+    retrieved_results,
+    max_chunks=None,
+    max_chunk_chars=None,
+    max_context_chars=None
+):
+
+    if not retrieved_results:
+        return ""
+
+    if max_chunks is None:
+        max_chunks = RAG_MAX_CONTEXT_CHUNKS
+
+    if max_chunk_chars is None:
+        max_chunk_chars = RAG_MAX_CHUNK_CHARS
+
+    if max_context_chars is None:
+        max_context_chars = RAG_MAX_CONTEXT_CHARS
+
+    parts = []
+
+    total_chars = 0
+
+    # --------------------------------------------------------
+    # RETRIEVED RESULTS
+    # --------------------------------------------------------
+
+    for result in retrieved_results[:max_chunks]:
+
+        if isinstance(result, dict):
+
+            text = str(
+                result.get(
+                    "text",
+                    ""
+                )
+            ).strip()
+
+            source = str(
+                result.get(
+                    "source",
+                    "Unknown source"
+                )
+            ).strip()
+
+            score = result.get(
+                "score",
+                None
+            )
+
+        else:
+
+            text = _get_chunk_text(
+                result
+            )
+
+            source = _get_chunk_source(
+                result
+            )
+
+            score = None
+
+        if not text:
+            continue
+
+        # ----------------------------------------------------
+        # LIMIT CHUNK SIZE
+        # ----------------------------------------------------
+
+        text = text[:max_chunk_chars]
+
+        if score is not None:
+
+            try:
+
+                header = (
+                    f"[Source: {source} | "
+                    f"Relevance: {float(score):.3f}]"
+                )
+
+            except Exception:
+
+                header = (
+                    f"[Source: {source}]"
+                )
+
+        else:
+
+            header = (
+                f"[Source: {source}]"
+            )
+
+        block = (
+            f"{header}\n"
+            f"{text}"
+        )
+
+        remaining = (
+            max_context_chars
+            - total_chars
+        )
+
+        if remaining <= 0:
+            break
+
+        if len(block) > remaining:
+
+            block = block[:remaining]
+
+        parts.append(
+            block
+        )
+
+        total_chars += len(block)
+
+    return "\n\n".join(
+        parts
+    )
+
+
+# ============================================================
+# CLEAN MODEL OUTPUT
+# ============================================================
+
+def clean_answer(text):
+
+    if not text:
+        return ""
+
+    text = str(text).strip()
+
+    # --------------------------------------------------------
+    # Remove common Mistral instruction wrappers
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"^\s*\[INST\]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"\s*\[/INST\]\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # --------------------------------------------------------
+    # Remove accidental "Answer:" prefix
+    # --------------------------------------------------------
+
+    text = re.sub(
+        r"^\s*Answer\s*:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    # --------------------------------------------------------
+    # Stop at accidental instruction leakage
+    # --------------------------------------------------------
+
+    stop_patterns = [
+        "\n[INST]",
+        "\n[/INST]",
+        "\nQuestion:",
+        "\nContext:",
+    ]
+
+    for marker in stop_patterns:
+
+        position = text.find(
+            marker
+        )
+
+        if position > 0:
+
+            text = text[:position]
+
+    return text.strip()
+
+
+# ============================================================
+# BUILD PROMPT
+# ============================================================
+
+def build_prompt(
+    query,
+    context
+):
+
+    query = str(
+        query or ""
+    ).strip()
+
+    context = str(
+        context or ""
+    ).strip()
+
+    # ========================================================
+    # NO CONTEXT
+    # ========================================================
+
+    if not context:
+
+        return (
+            "<s>[INST] "
+            "You are an offline document question-answering "
+            "assistant.\n\n"
+            "There is no relevant information in the indexed "
+            "documents.\n\n"
+            "Question: "
+            f"{query}\n\n"
+            "If the answer is not available in the indexed "
+            "documents, say exactly:\n"
+            "\"I couldn't find this information in the "
+            "provided documents.\"\n"
+            "[/INST]"
+        )
+
+    # ========================================================
+    # RAG PROMPT
+    # ========================================================
+
+    return (
+        "<s>[INST] "
+        "You are an offline RAG assistant.\n\n"
+
+        "Answer the user's question using ONLY the "
+        "provided document context.\n\n"
+
+        "STRICT RULES:\n"
+        "1. Do not use outside knowledge.\n"
+        "2. Do not invent facts.\n"
+        "3. If the answer is not present in the context, "
+        "say exactly: "
+        "\"I couldn't find this information in the "
+        "provided documents.\"\n"
+        "4. Give a concise and direct answer.\n"
+        "5. When answering from a document, mention the "
+        "source filename naturally.\n"
+        "6. Never invent a filename.\n\n"
+
+        "DOCUMENT CONTEXT:\n"
+        "-----------------\n"
+        f"{context}\n"
+        "-----------------\n\n"
+
+        "QUESTION:\n"
+        f"{query}\n\n"
+
+        "ANSWER:\n"
+        "[/INST]"
+    )
+
+
+# ============================================================
+# GENERATE ANSWER
+# ============================================================
+
+def generate_answer(
+    query,
+    context,
+    callback=None,
+    stop_event=None,
+    max_tokens=None
+):
+
+    global llm
+
+    query = str(
+        query or ""
+    ).strip()
+
+    if not query:
+
+        return ""
+
+    # --------------------------------------------------------
+    # LOAD MODEL
+    # --------------------------------------------------------
+
+    if llm is None:
+
+        loaded = load_llm(
+            callback=callback
+        )
+
+        if not loaded:
+
+            return (
+                "The local AI model could not be loaded."
+            )
+
+    # --------------------------------------------------------
+    # BUILD PROMPT
+    # --------------------------------------------------------
+
+    prompt = build_prompt(
+        query,
+        context
+    )
+
+    # --------------------------------------------------------
+    # TOKEN LIMIT
+    # --------------------------------------------------------
+
+    if max_tokens is None:
+
+        max_tokens = MAX_OUTPUT_TOKENS
+
+    max_tokens = max(
+        RAG_MIN_GENERATION_TOKENS,
+        min(
+            int(max_tokens),
+            MAX_OUTPUT_TOKENS
+        )
+    )
+
+    # --------------------------------------------------------
+    # GENERATION
+    # --------------------------------------------------------
+
+    try:
+
+        _callback(
+            callback,
+            "Generating answer locally..."
+        )
+
+        output = llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.15,
+            top_p=0.9,
+            repeat_penalty=1.10,
+            stop=[
+                "</s>",
+                "[/INST]",
+                "\n[INST]"
+            ],
+            echo=False,
+            stream=False
+        )
+
+        # ----------------------------------------------------
+        # EXTRACT TEXT
+        # ----------------------------------------------------
+
+        text = ""
+
+        if isinstance(output, dict):
+
+            choices = output.get(
+                "choices",
+                []
+            )
+
+            if choices:
+
+                text = choices[0].get(
+                    "text",
+                    ""
+                )
+
+        else:
+
+            text = str(
+                output
+            )
+
+        answer = clean_answer(
+            text
+        )
+
+        if not answer:
+
+            return (
+                "I couldn't generate an answer from "
+                "the provided documents."
+            )
+
+        return answer
+
+    except Exception as e:
+
+        print(
+            "Generation error:",
+            e
+        )
+
+        _callback(
+            callback,
+            f"Generation error: {e}"
+        )
+
+        return (
+            "The local AI encountered an error "
+            "while generating the answer."
+        )
+
+
+# ============================================================
+# COMPLETE RAG PIPELINE
+# ============================================================
+
+def answer_query(
+    query,
+    retrieved_results,
+    callback=None,
+    stop_event=None,
+    max_tokens=None
+):
+    """
+    Complete local RAG pipeline:
+
+        FAISS results
+              ↓
+        Context builder
+              ↓
+        Mistral prompt
+              ↓
+        Local GPU inference
+              ↓
+        Clean final answer
+    """
+
+    query = str(
+        query or ""
+    ).strip()
+
+    if not query:
+
+        return ""
+
+    # --------------------------------------------------------
+    # STOP CHECK
+    # --------------------------------------------------------
+
+    if (
+        stop_event is not None
+        and stop_event.is_set()
+    ):
+
+        return "Generation stopped."
+
+    # --------------------------------------------------------
+    # BUILD CONTEXT
+    # --------------------------------------------------------
+
+    context = build_context(
+        retrieved_results
+    )
+
+    # --------------------------------------------------------
+    # GENERATE
+    # --------------------------------------------------------
+
+    answer = generate_answer(
+        query=query,
+        context=context,
+        callback=callback,
+        stop_event=stop_event,
+        max_tokens=max_tokens
+    )
+
+    return answer
+
+
+# ============================================================
+# SIMPLE TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("OFFLINE RAG LLM TEST")
+    print("=" * 60)
+
+    test_context = (
+        "[Source: India.pdf | Relevance: 0.92]\n"
+        "India is a country in South Asia. "
+        "New Delhi is the capital of India."
+    )
+
+    answer = generate_answer(
+        "What is the capital of India?",
+        test_context,
+        callback=print
+    )
+
+    print()
+    print("ANSWER:")
+    print(answer)
+
+# ============================================================
+# DOCUMENT RETRIEVAL
+# ============================================================
+
+def search_documents(
+    query,
+    embedder=None,
+    state=None,
+    top_k=5
+):
+    """
+    Retrieve the most relevant document chunks using FAISS.
+    """
+
+    if not query:
+        return []
+
+    if state is None:
+        state = {}
+
+    chunks = state.get("chunks", [])
+    index = state.get("faiss_index")
+
+    if embedder is None:
+        embedder = state.get("embedder")
+
+    if not chunks:
+        return []
+
+    if index is None:
+        return []
+
+    if embedder is None:
+        raise ValueError("Embedding model is not available.")
+
+    # Create query embedding
+    query_vector = embedder.encode(
+        [query],
+        convert_to_numpy=True,
+        show_progress_bar=False
+    )
+
+    query_vector = np.asarray(
+        query_vector,
+        dtype=np.float32
+    )
+
+    if query_vector.ndim == 1:
+        query_vector = query_vector.reshape(1, -1)
+
+    # Search FAISS
+    scores, indices = index.search(
+        query_vector,
+        min(top_k, len(chunks))
+    )
+
+    results = []
+
+    for rank, (score, idx) in enumerate(
+        zip(scores[0], indices[0]),
+        start=1
+    ):
+
+        if idx < 0 or idx >= len(chunks):
+            continue
+
+        item = chunks[idx]
+
+        if isinstance(item, dict):
+            text_value = str(
+                item.get("text", "")
+            )
+
+            source = str(
+                item.get(
+                    "source",
+                    item.get(
+                        "filename",
+                        "Unknown source"
+                    )
+                )
+            )
+
+        else:
+            text_value = str(item)
+            source = "Unknown source"
+
+        results.append({
+            "rank": rank,
+            "source": source,
+            "text": text_value,
+            "score": float(score)
+        })
+
+    return results
+

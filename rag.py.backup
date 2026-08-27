@@ -1,0 +1,246 @@
+﻿import queue
+from core import config as core_config
+from core import history as core_history
+from core import document_processor as core_document_processor
+from core import document as core_document
+from core import ingestion as core_ingestion
+from core import retrieval as core_retrieval
+from core import answer_engine as core_answer_engine
+embedder = None
+llm = None
+chunks = []
+embeddings = None
+faiss_index = None
+last_response_text = ""
+current_engine = None
+is_speaking = False
+is_listening = False
+audio_queue = queue.Queue()
+# ============================================================
+# MODULAR CORE STATE
+# ============================================================
+
+CORE_STATE = {
+    "chunks": chunks,
+    "embeddings": embeddings,
+    "faiss_index": faiss_index,
+}
+
+
+def sync_core_rag_state():
+    """
+    Synchronize the legacy rag.py state with the modular core.
+
+    The application is currently being migrated from the original
+    monolithic rag.py architecture to the core/ architecture.
+
+    This bridge allows both sides to work safely during migration.
+    """
+
+    global chunks
+    global embeddings
+    global faiss_index
+    global embedder
+
+    CORE_STATE["chunks"] = chunks
+    CORE_STATE["embeddings"] = embeddings
+    CORE_STATE["faiss_index"] = faiss_index
+
+    # Core ingestion state
+    core_ingestion.chunks = chunks
+    core_ingestion.embeddings = embeddings
+    core_ingestion.faiss_index = faiss_index
+    core_ingestion.embedder = embedder
+
+# ============================================================
+# MODULAR CHUNKING COMPATIBILITY BRIDGE
+# ============================================================
+
+def create_chunks(
+    text,
+    source,
+    chunk_size=500,
+    overlap=80
+):
+    """
+    Compatibility wrapper for the modular chunking implementation.
+    """
+
+    return core_document.create_chunks(
+        text=text,
+        source=source,
+        chunk_size=chunk_size,
+        overlap=overlap
+    )
+
+
+
+# ============================================================
+# MODULAR DOCUMENT PROCESSOR COMPATIBILITY BRIDGE
+# ============================================================
+
+def extract_pdf(path):
+    """
+    Compatibility wrapper for the modular PDF extractor.
+    """
+    return core_document_processor.extract_pdf(path)
+
+
+def extract_docx(path):
+    """
+    Compatibility wrapper for the modular DOCX extractor.
+    """
+    return core_document_processor.extract_docx(path)
+
+
+def extract_txt(path):
+    """
+    Compatibility wrapper for the modular TXT extractor.
+    """
+    return core_document_processor.extract_txt(path)
+
+
+def process_audio(path):
+    """
+    Compatibility wrapper for the modular audio processor.
+
+    If audio processing is not implemented by the modular
+    document processor, preserve the legacy function.
+    """
+    if hasattr(core_document_processor, "process_audio"):
+        return core_document_processor.process_audio(path)
+
+    raise AttributeError(
+        "core.document_processor does not provide process_audio()."
+    )
+
+
+
+# ============================================================
+# MODULAR EMBEDDER COMPATIBILITY BRIDGE
+# ============================================================
+
+def load_embedder(status_callback=None):
+    """
+    Compatibility wrapper for the modular core embedder loader.
+    """
+
+    global embedder
+
+    result = core_document.load_embedder(
+        status_callback=status_callback
+    )
+
+    # Support either:
+    #   load_embedder() -> embedder
+    # or
+    #   load_embedder() -> True/False
+    #
+    # The modular implementation determines the actual return value.
+
+    if result is not None and result is not True and result is not False:
+        embedder = result
+
+    elif getattr(core_document, "embedder", None) is not None:
+        embedder = core_document.embedder
+
+    elif getattr(core_document, "get_embedder", None):
+        embedder = core_document.get_embedder()
+
+    if embedder is not None:
+        sync_core_rag_state()
+        return True
+
+    return bool(result)
+
+
+
+# ============================================================
+# MODULAR CORE COMPATIBILITY BRIDGE
+# ============================================================
+
+def build_faiss_index(vectors):
+    """
+    Compatibility wrapper for the modular ingestion implementation.
+    """
+
+    return core_ingestion.build_faiss_index(
+        vectors
+    )
+
+
+def load_cached_memory(
+    target_folder,
+    status_callback=None
+):
+    """
+    Compatibility wrapper used by the existing GUI.
+    """
+
+    global chunks
+    global embeddings
+    global faiss_index
+
+    success = core_ingestion.load_cached_memory(
+        target_folder,
+        status_callback=status_callback,
+        state=CORE_STATE
+    )
+
+    if success:
+
+        chunks = CORE_STATE["chunks"]
+        embeddings = CORE_STATE["embeddings"]
+        faiss_index = CORE_STATE["faiss_index"]
+
+        sync_core_rag_state()
+
+    return success
+
+
+def run_ingestion(
+    target_folder,
+    status_callback,
+    stop_event=None
+):
+    """
+    Compatibility wrapper used by the existing GUI.
+
+    The actual ingestion work is performed by core.ingestion.
+    """
+
+    global chunks
+    global embeddings
+    global faiss_index
+    global embedder
+
+    success = core_ingestion.run_ingestion(
+        target_folder=target_folder,
+        status_callback=status_callback,
+        stop_event=stop_event,
+        state=CORE_STATE,
+        load_embedder=load_embedder,
+        extract_pdf=extract_pdf,
+        extract_docx=extract_docx,
+        extract_txt=extract_txt,
+        process_audio=process_audio,
+        create_chunks=create_chunks,
+        embedder=embedder
+    )
+
+    if success:
+
+        chunks = CORE_STATE["chunks"]
+        embeddings = CORE_STATE["embeddings"]
+        faiss_index = CORE_STATE["faiss_index"]
+
+        sync_core_rag_state()
+
+    return success
+
+
+
+
+
+
+

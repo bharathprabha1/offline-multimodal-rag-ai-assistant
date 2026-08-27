@@ -1,0 +1,120 @@
+﻿from pathlib import Path
+import subprocess
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+MODEL_PATH = str(BASE_DIR / "models" / "mistral-7b-instruct-v0.2.Q4_K_M.gguf")
+LLAMA_PATH = str(BASE_DIR / "llama_cpp_local" / "llama-cli.exe")
+
+MAX_OUTPUT_TOKENS = 96
+
+
+def generate_answer(question, context=""):
+    """
+    Generate one short answer using the local Mistral model.
+
+    The CLI process is intentionally used here for compatibility with
+    the current project. Output is limited to keep responses fast.
+    """
+
+    if context:
+        prompt = (
+            "Use ONLY the following document context to answer the question. "
+            "Do not use outside knowledge. "
+            "If the answer is not present in the context, say: "
+            "I couldn't find this information in the provided documents. "
+            "Answer briefly.\n\n"
+            "DOCUMENT CONTEXT:\n"
+            + str(context)
+            + "\n\n"
+            "QUESTION: "
+            + str(question)
+            + "\n"
+            "ANSWER:"
+        )
+    else:
+        prompt = (
+            "Answer briefly in one or two sentences.\n"
+            "QUESTION: "
+            + str(question)
+            + "\n"
+            "ANSWER:"
+        )
+
+    command = [
+        LLAMA_PATH,
+        "-m", MODEL_PATH,
+        "-ngl", "16",
+        "-c", "1536",
+        "-p", prompt,
+        "-n", str(MAX_OUTPUT_TOKENS),
+        "--temp", "0.2",
+        "--top-p", "0.9",
+        "--repeat-penalty", "1.1",
+        "--no-display-prompt",
+        "--single-turn"
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=60
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip() or
+            "Mistral inference failed."
+        )
+
+    output = result.stdout.strip()
+
+    marker = "ANSWER:"
+    if marker in output:
+        output = output.rsplit(marker, 1)[-1].strip()
+
+    if "[ Prompt:" in output:
+        output = output.split("[ Prompt:", 1)[0].strip()
+
+    if "Exiting..." in output:
+        output = output.split("Exiting...", 1)[0].strip()
+
+    return output.strip()
+
+
+def answer_from_retrieval(question, results):
+
+    if not results:
+        return (
+            "I couldn't find this information in the "
+            "provided documents."
+        )
+
+    context_parts = []
+
+    for result in results:
+
+        source = result.get("source", "Unknown")
+        text = result.get("text", "")
+
+        if not text:
+            continue
+
+        context_parts.append(
+            f"[Source: {source}]\n{text}"
+        )
+
+    if not context_parts:
+        return (
+            "I couldn't find this information in the "
+            "provided documents."
+        )
+
+    context = "\n\n".join(context_parts)
+
+    return generate_answer(
+        question,
+        context
+    )

@@ -1,0 +1,642 @@
+﻿import sys
+import os
+import json
+
+import numpy as np
+import faiss
+
+from .config import (
+    RAG_MAX_CONTEXT_CHUNKS,
+    RAG_MAX_CHUNK_CHARS,
+    RAG_MAX_CONTEXT_CHARS,
+    TOP_K,
+    SIMILARITY_THRESHOLD,
+)
+
+
+# ============================================================
+# FAISS
+# ============================================================
+
+def build_faiss_index(vectors):
+    """
+    Build a FAISS inner-product index from embedding vectors.
+
+    Vectors are L2-normalized first, so inner-product scores
+    are equivalent to cosine similarity.
+    """
+
+    if vectors is None:
+        return None
+
+    matrix = np.asarray(
+        vectors,
+        dtype=np.float32
+    )
+
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        return None
+
+    faiss.normalize_L2(matrix)
+
+    dimension = int(matrix.shape[1])
+
+    index = faiss.IndexFlatIP(
+        dimension
+    )
+
+    index.add(matrix)
+
+    return index
+
+
+# ============================================================
+# LOAD CACHED MEMORY
+# ============================================================
+
+def load_cached_memory(
+    target_folder,
+    status_callback=None,
+    state=None
+):
+    """
+    Load previously generated chunks, embeddings and FAISS index.
+
+    state must contain:
+        chunks
+        embeddings
+        faiss_index
+    """
+
+    if state is None:
+        raise ValueError(
+            "load_cached_memory requires a state dictionary."
+        )
+
+    cache_dir = os.path.join(
+        target_folder,
+        "cache"
+    )
+
+    chunks_file = os.path.join(
+        cache_dir,
+        "chunks.json"
+    )
+
+    embeddings_file = os.path.join(
+        cache_dir,
+        "embeddings.npy"
+    )
+
+    faiss_file = os.path.join(
+        cache_dir,
+        "faiss.index"
+    )
+
+    if not (
+        os.path.exists(chunks_file)
+        and os.path.exists(embeddings_file)
+    ):
+        return False
+
+    try:
+
+        # ----------------------------------------------------
+        # Load chunks
+        # ----------------------------------------------------
+
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            cached_chunks = json.load(f)
+
+        # ----------------------------------------------------
+        # Load embeddings
+        # ----------------------------------------------------
+
+        cached_embeddings = np.load(
+            embeddings_file
+        )
+
+        if not cached_chunks:
+            return False
+
+        if (
+            cached_embeddings.ndim != 2
+            or len(cached_chunks) != len(cached_embeddings)
+        ):
+
+            print(
+                "Cache size mismatch."
+            )
+
+            return False
+
+        state["chunks"] = cached_chunks
+
+        state["embeddings"] = np.asarray(
+            cached_embeddings,
+            dtype=np.float32
+        )
+
+        # ----------------------------------------------------
+        # Load FAISS index if available
+        # ----------------------------------------------------
+
+        loaded_index = None
+
+        if os.path.exists(faiss_file):
+
+            try:
+
+                loaded_index = faiss.read_index(
+                    faiss_file
+                )
+
+                if (
+                    loaded_index.ntotal
+                    != len(state["chunks"])
+                    or loaded_index.d
+                    != state["embeddings"].shape[1]
+                ):
+
+                    print(
+                        "FAISS cache mismatch. "
+                        "Rebuilding index."
+                    )
+
+                    loaded_index = None
+
+            except Exception as e:
+
+                print(
+                    "FAISS cache load error:",
+                    e
+                )
+
+                loaded_index = None
+
+        # ----------------------------------------------------
+        # Rebuild FAISS if necessary
+        # ----------------------------------------------------
+
+        if loaded_index is None:
+
+            loaded_index = build_faiss_index(
+                state["embeddings"]
+            )
+
+            if loaded_index is None:
+                return False
+
+            try:
+
+                faiss.write_index(
+                    loaded_index,
+                    faiss_file
+                )
+
+            except Exception as e:
+
+                print(
+                    "FAISS cache save warning:",
+                    e
+                )
+
+        state["faiss_index"] = loaded_index
+
+        # ----------------------------------------------------
+        # Normalize NumPy embeddings
+        # ----------------------------------------------------
+
+        faiss.normalize_L2(
+            state["embeddings"]
+        )
+
+        if status_callback:
+
+            status_callback(
+                f"Loaded FAISS memory: "
+                f"{len(state['chunks'])} segments."
+            )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "Cache load error:",
+            e
+        )
+
+        state["faiss_index"] = None
+
+        return False
+
+
+# ============================================================
+# INGESTION
+# ============================================================
+
+def run_ingestion(
+    target_folder,
+    status_callback,
+    stop_event=None,
+    state=None,
+    load_embedder=None,
+    extract_pdf=None,
+    extract_docx=None,
+    extract_txt=None,
+    process_audio=None,
+    create_chunks=None,
+    embedder=None
+):
+    """
+    Modular ingestion pipeline.
+
+    Uses the already-loaded embedder when supplied.
+    Loads a model only when no valid embedder is available.
+    """
+
+    if state is None:
+        raise ValueError(
+            "run_ingestion requires a state dictionary."
+        )
+
+    if extract_pdf is None:
+        raise ValueError(
+            "run_ingestion requires extract_pdf."
+        )
+
+    if extract_docx is None:
+        raise ValueError(
+            "run_ingestion requires extract_docx."
+        )
+
+    if extract_txt is None:
+        raise ValueError(
+            "run_ingestion requires extract_txt."
+        )
+
+    if process_audio is None:
+        raise ValueError(
+            "run_ingestion requires process_audio."
+        )
+
+    if create_chunks is None:
+        raise ValueError(
+            "run_ingestion requires create_chunks."
+        )
+
+    # ------------------------------------------------------------
+    # EMBEDDER
+    # ------------------------------------------------------------
+
+    # IMPORTANT:
+    # If rag.py already loaded the SentenceTransformer,
+    # use that exact object.
+    if (
+        embedder is None
+        or not callable(getattr(embedder, "encode", None))
+    ):
+
+        if load_embedder is None:
+            raise ValueError(
+                "No valid embedder and no load_embedder function."
+            )
+
+        loaded_embedder = load_embedder(
+            status_callback
+        )
+
+        # load_embedder may return either:
+        #   1. the actual SentenceTransformer object
+        #   2. True after storing the model elsewhere
+        #
+        # Prefer the returned model when available.
+        if (
+            loaded_embedder is not None
+            and callable(
+                getattr(loaded_embedder, "encode", None)
+            )
+        ):
+            embedder = loaded_embedder
+
+        # Otherwise try the module-level embedder maintained by
+        # the document/core layer.
+        elif callable(
+            getattr(
+                sys.modules.get(__name__),
+                "embedder",
+                None
+            )
+        ):
+            embedder = sys.modules[__name__].embedder
+
+    if (
+        embedder is None
+        or not callable(getattr(embedder, "encode", None))
+    ):
+
+        if status_callback:
+            status_callback(
+                "Invalid embedding model: encode() is unavailable."
+            )
+
+        return False
+
+    # Keep modular state synchronized.
+    state["embedder"] = embedder
+
+    # ------------------------------------------------------------
+    # FOLDER
+    # ------------------------------------------------------------
+
+    if status_callback:
+        status_callback(
+            f"Scanning folder: "
+            f"{os.path.basename(target_folder)}"
+        )
+
+    try:
+
+        files = os.listdir(
+            target_folder
+        )
+
+    except Exception as e:
+
+        if status_callback:
+            status_callback(
+                f"Folder access error: {e}"
+            )
+
+        return False
+
+    if not files:
+
+        if status_callback:
+            status_callback(
+                "Folder is empty."
+            )
+
+        return False
+
+    # ------------------------------------------------------------
+    # EXTRACT DOCUMENTS
+    # ------------------------------------------------------------
+
+    all_chunks = []
+
+    total_files = len(files)
+
+    for index, filename in enumerate(
+        files,
+        start=1
+    ):
+
+        if (
+            stop_event is not None
+            and stop_event.is_set()
+        ):
+
+            if status_callback:
+                status_callback(
+                    "Document processing stopped."
+                )
+
+            return False
+
+        path = os.path.join(
+            target_folder,
+            filename
+        )
+
+        if not os.path.isfile(path):
+            continue
+
+        extension = (
+            os.path.splitext(filename)[1]
+            .lower()
+        )
+
+        if status_callback:
+            status_callback(
+                f"[{index}/{total_files}] "
+                f"Reading: {filename}"
+            )
+
+        text = ""
+
+        try:
+
+            if extension == ".pdf":
+
+                text = extract_pdf(path)
+
+            elif extension == ".docx":
+
+                text = extract_docx(path)
+
+            elif extension == ".txt":
+
+                text = extract_txt(path)
+
+            elif extension == ".wav":
+
+                text = process_audio(path)
+
+            else:
+
+                # Ignore unsupported files such as:
+                # .jpeg, .jpg, .png, .mp4, cache files, etc.
+                continue
+
+        except Exception as e:
+
+            if status_callback:
+                status_callback(
+                    f"Error reading {filename}: "
+                    f"{str(e)[:100]}"
+                )
+
+            continue
+
+        if not text:
+            continue
+
+        # --------------------------------------------------------
+        # CREATE CHUNKS
+        # --------------------------------------------------------
+
+        try:
+
+            file_chunks = create_chunks(
+                text,
+                filename
+            )
+
+        except TypeError:
+
+            try:
+
+                file_chunks = create_chunks(
+                    text
+                )
+
+            except Exception as e:
+
+                if status_callback:
+                    status_callback(
+                        f"Chunking error: "
+                        f"{str(e)[:100]}"
+                    )
+
+                continue
+
+        except Exception as e:
+
+            if status_callback:
+                status_callback(
+                    f"Chunking error: "
+                    f"{str(e)[:100]}"
+                )
+
+            continue
+
+        if file_chunks:
+            all_chunks.extend(
+                file_chunks
+            )
+
+    # ------------------------------------------------------------
+    # CHECK CHUNKS
+    # ------------------------------------------------------------
+
+    if not all_chunks:
+
+        if status_callback:
+            status_callback(
+                "No supported document content found."
+            )
+
+        return False
+
+    if status_callback:
+        status_callback(
+            f"Creating embeddings for "
+            f"{len(all_chunks)} segments..."
+        )
+
+    # ------------------------------------------------------------
+    # EMBEDDINGS
+    # ------------------------------------------------------------
+
+    try:
+
+        texts = []
+
+        for item in all_chunks:
+
+            if isinstance(item, dict):
+
+                texts.append(
+                    str(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+                )
+
+            else:
+
+                texts.append(
+                    str(item)
+                )
+
+        vectors = embedder.encode(
+            texts,
+            convert_to_numpy=True,
+            show_progress_bar=False
+        )
+
+        vectors = np.asarray(
+            vectors,
+            dtype=np.float32
+        )
+
+        if (
+            vectors.ndim != 2
+            or vectors.shape[0] == 0
+        ):
+
+            if status_callback:
+                status_callback(
+                    "Embedding generation returned no vectors."
+                )
+
+            return False
+
+    except Exception as e:
+
+        if status_callback:
+            status_callback(
+                f"Embedding error: {e}"
+            )
+
+        return False
+
+    # ------------------------------------------------------------
+    # FAISS
+    # ------------------------------------------------------------
+
+    try:
+
+        index = build_faiss_index(
+            vectors
+        )
+
+        if index is None:
+
+            if status_callback:
+                status_callback(
+                    "Failed to build FAISS index."
+                )
+
+            return False
+
+    except Exception as e:
+
+        if status_callback:
+            status_callback(
+                f"FAISS error: {e}"
+            )
+
+        return False
+
+    # ------------------------------------------------------------
+    # UPDATE STATE
+    # ------------------------------------------------------------
+
+    state["chunks"] = all_chunks
+    state["embeddings"] = vectors
+    state["faiss_index"] = index
+    state["embedder"] = embedder
+
+    if status_callback:
+        status_callback(
+            f"Ingestion complete: "
+            f"{len(all_chunks)} chunks, "
+            f"{vectors.shape[0]} embeddings, "
+            f"{index.ntotal} FAISS vectors."
+        )
+
+    return True
+
+
+
+
